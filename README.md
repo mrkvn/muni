@@ -5,7 +5,7 @@ Dictation app for macOS. Hold a hotkey, speak, release — cleaned-up text is pa
 - **Cleanup pass** — filler words removed, "scratch that" corrections applied, grammar and punctuation fixed, your phrasing preserved.
 - **Language auto-detect** — English, Tagalog, and Taglish presses are routed automatically, with the detection running locally on-device by default.
 
-![Muni demo](assets/demo.gif)
+<!-- Demo GIF goes here once recorded: ![Muni demo](assets/demo.gif) -->
 
 ## Download
 

@@ -104,7 +104,7 @@ Official binaries include crash reporting (Sentry) and anonymized usage analytic
 
 ## Support
 
-Muni is free. If it's useful to you, you can [support development](https://buy.polar.sh/polar_cl_uRbBQfWPjdQEcdzRJTAqzoA8NZ1w0pNiv1pum2Q2Vzw) — pay what you like.
+Muni is free. If it's useful to you, you can [support development](https://usemuni.app/support) — pay what you like.
 
 Bug reports and feature requests go to [GitHub Issues](https://github.com/mrkvn/muni/issues).
 

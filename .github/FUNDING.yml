@@ -2,4 +2,9 @@
 # The native `polar:` key exists, but it links to the Polar storefront page
 # rather than straight to the checkout, and the org has no project-branded
 # slug. Do not switch without revisiting that decision.
-custom: ["https://buy.polar.sh/polar_cl_uRbBQfWPjdQEcdzRJTAqzoA8NZ1w0pNiv1pum2Q2Vzw"]
+#
+# The URL points at usemuni.app/support, which 302s to the Polar checkout.
+# GitHub renders a `custom:` entry as raw truncated link text, so this shows
+# the project's own domain instead of an opaque polar_cl_… tracking URL — and
+# the checkout link can be regenerated without editing this file.
+custom: ["https://usemuni.app/support"]

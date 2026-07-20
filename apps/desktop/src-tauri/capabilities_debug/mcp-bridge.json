@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "mcp-bridge-debug",
+  "description": "Debug-only: exposes the MCP bridge plugin to the Tauri MCP server for DOM/CSS inspection during development. This file lives OUTSIDE the auto-discovered capabilities/ directory on purpose (the build-time glob is capabilities/**/*), so it is never compiled into the static ACL. It is registered at runtime via Manager::add_capability under #[cfg(debug_assertions)] in lib.rs setup, so release builds never grant mcp-bridge to any window.",
+  "windows": ["main", "onboarding"],
+  "permissions": ["mcp-bridge:default"]
+}

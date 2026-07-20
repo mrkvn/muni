@@ -1,0 +1,91 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Muni",
+  "version": "0.6.0",
+  "identifier": "com.muni.app",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "",
+        "url": "app.html",
+        "width": 1180,
+        "height": 800,
+        "minWidth": 720,
+        "minHeight": 480,
+        "resizable": true,
+        "visible": false,
+        "center": true,
+        "titleBarStyle": "Overlay"
+      },
+      {
+        "label": "onboarding",
+        "title": "Welcome to Muni",
+        "url": "app.html",
+        "width": 560,
+        "height": 480,
+        "resizable": false,
+        "visible": false,
+        "center": true
+      },
+      {
+        "label": "hud",
+        "url": "hud.html",
+        "width": 340,
+        "height": 104,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false,
+        "visible": false,
+        "resizable": false,
+        "shadow": false,
+        "acceptFirstMouse": false,
+        "visibleOnAllWorkspaces": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data: blob:; media-src 'self' asset: http://asset.localhost blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'",
+      "devCsp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data: blob:; media-src 'self' asset: http://asset.localhost blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self' ipc: http://ipc.localhost ws://localhost:1420 http://localhost:1420; object-src 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": ["resources/CleanupPrompt.md", "resources/ggml-tiny-q5_1.bin"],
+    "macOS": {
+      "minimumSystemVersion": "14.0",
+      "signingIdentity": "Muni Dev",
+      "entitlements": "entitlements.plist",
+      "hardenedRuntime": false
+    },
+    "createUpdaterArtifacts": false
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://example.com/muni/releases/latest.json"
+      ],
+      "pubkey": "REPLACE_WITH_PUBLIC_KEY_FROM_TAURI_SIGNER_GENERATE",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

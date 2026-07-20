@@ -1,0 +1,21 @@
+[package]
+name = "parakeet-sidecar"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone workspace — this crate pulls `ort` 2.0.0-rc.12 (via parakeet-rs),
+# which CANNOT coexist with the app's `ort` =2.0.0-rc.10 (pinned by
+# voice_activity_detector) because ort-sys uses `links = "onnxruntime"`. Keeping
+# its own [workspace] guarantees the app build never tries to link both. The
+# app talks to this binary over stdin/stdout instead. Same isolation trick as
+# scripts/parakeet_spike.
+[workspace]
+
+[dependencies]
+parakeet-rs = "0.3"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

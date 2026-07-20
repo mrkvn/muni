@@ -1,0 +1,207 @@
+[package]
+name = "muni"
+version = "0.6.0"
+description = "Muni — push-to-talk dictation"
+authors = ["mrkvn"]
+edition = "2021"
+rust-version = "1.80"
+# The test-only `fake_parakeet_sidecar` bin (see [[bin]] below) makes this a
+# multi-binary package, so `cargo run`/`tauri dev` need an explicit default.
+default-run = "muni"
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "muni_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# Feature gate so the fake sidecar (and its integration test) are compiled ONLY
+# when testing — `required-features` keeps it out of `cargo build`/`tauri build`,
+# so it's never compiled into a release. `make test` enables it.
+[features]
+test-fixtures = []
+
+# Test-only fake sidecar speaking the Parakeet wire protocol (no ONNX/model),
+# so tests/parakeet_sidecar.rs can drive ParakeetClient in CI. Reached via the
+# CARGO_BIN_EXE_fake_parakeet_sidecar env var Cargo sets for integration tests.
+# Gated behind `test-fixtures` so it is NOT built for release bundles.
+[[bin]]
+name = "fake_parakeet_sidecar"
+path = "tests/fixtures/fake_parakeet_sidecar.rs"
+required-features = ["test-fixtures"]
+test = false
+doc = false
+
+# The deepgram_mock integration test drives DeepgramClient::set_finalize_timeout,
+# which is gated behind `test-fixtures` (a lib's `#[cfg(test)]` is not active for
+# an external integration crate). Declaring the target with `required-features`
+# lets the documented `cargo test --test deepgram_mock` auto-enable the feature.
+[[test]]
+name = "deepgram_mock"
+required-features = ["test-fixtures"]
+
+# Plan 039 slice 3 finalize-recovery tests drive the test-only
+# `set_finalize_timeout` / `set_timeout` hooks (gated behind `test-fixtures`,
+# same as `deepgram_mock`), so they must declare the feature to be picked up by
+# a plain `cargo test`.
+[[test]]
+name = "deepgram_finalize_recovery"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "gladia_finalize_recovery"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "groq_whisper_mock"
+required-features = ["test-fixtures"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# `macos-private-api` is required for the HUD overlay's transparent window
+# to render with a clear webview background — wry's `drawsBackground=NO`
+# call on WKWebView is gated behind this feature. Without it, `transparent:
+# true` only makes the NSWindow translucent while WebKit keeps painting an
+# opaque white canvas underneath the page. Tradeoff: the app uses Apple
+# private APIs and is therefore not eligible for the Mac App Store; we
+# distribute via DMG/notarisation only, so this is acceptable.
+tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
+tauri-plugin-opener = "2"
+tauri-plugin-log = "2"
+tauri-plugin-store = "2"
+tauri-plugin-global-shortcut = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+# Direct dep on `time` so `lib::run` can install a custom log formatter
+# with millisecond-precision timestamps. The default tauri-plugin-log
+# formatter rounds to seconds, which is too coarse for sub-second
+# latency analysis (e.g. §10 of manual_qa_v1.md). Already pulled in as
+# a transitive dep by tauri-plugin-log itself, so this only formalises
+# the dependency without adding bytes.
+time = { version = "0.3", features = ["formatting", "parsing", "local-offset", "macros"] }
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["sync", "time", "macros", "rt", "rt-multi-thread", "process", "io-util"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls", "multipart"] }
+futures-util = "0.3"
+async-trait = "0.1"
+cpal = "0.15"
+# Feature 032 — human-readable device label sent to Polar on activation
+# (shown in the customer portal so the user recognises which Mac holds the
+# single activation slot). Resolved once per activation, never on the hot path.
+whoami = "2"
+rubato = "0.15"
+crossbeam-channel = "0.5"
+bytemuck = "1"
+hound = "3"
+# Phase 8 secrets — Keychain on macOS, Credential Manager on Windows,
+# Secret Service / kwallet on Linux. The `apple-native` and `windows-native`
+# features avoid pulling the (heavy) `secret-service` D-Bus client on macOS;
+# we keep `linux-native-sync-persistent` so future Linux builds work without
+# code changes. v3 is the current major as of Cargo.lock writing.
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native-sync-persistent"] }
+# Phase 10 history store — single-file SQLite. `bundled` ships the
+# sqlite3 source inside the crate so we don't need a system libsqlite
+# at link time; this also pins the SQLite version across dev machines
+# / CI runners. ~1MB binary growth is acceptable for one persistence
+# concern.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Phase 10 silent updater — checks on launch, downloads in background,
+# prompts on next launch (per plan §002 R8). Configuration (pubkey,
+# endpoints) lives in `tauri.conf.json plugins.updater`; without those
+# `app.updater().check()` returns a typed error at runtime but plugin
+# init still succeeds.
+tauri-plugin-updater = "2"
+# Feature 013 — My Words substitution. `regex` for the per-rule compiled
+# matcher, `parking_lot::RwLock` for the read-heavy snapshot guard. Both
+# were already transitive deps (via tauri / tauri-plugin-store); the
+# direct declarations formalise the dependency at this crate's surface.
+regex = "1"
+parking_lot = "0.12"
+# Feature 020 — local audio-LID. whisper.cpp via the whisper-rs binding.
+# `metal` feature compiles whisper.cpp's Metal kernels for Apple Silicon
+# (the only platform we ship today). `default-features = false` keeps
+# the build off the OpenBLAS/CUDA paths.
+whisper-rs = { version = "0.13", default-features = false, features = ["metal"] }
+# Feature 023 (backlog 0040) — silent-press VAD gate. Bundles the
+# Silero VAD v5 ONNX model in-crate; pulls `ort` (ONNX Runtime) as a
+# transitive dep. ~2 MB binary growth, no separate resource file.
+voice_activity_detector = "0.2.1"
+# Feature 033 — post-launch monitoring. `sentry` is the raw crate (NOT the
+# Tauri-v1-only `sentry-tauri` plugin); `sentry-rust-minidump` adds abort-safe
+# native crash capture via a separate monitor process (it pins `sentry ^0.48`).
+# Both are no-ops at runtime unless a DSN is baked (prod only) — dev/staging
+# resolve an empty DSN and never call `sentry::init`. `default-features` are
+# kept so the panic + backtrace + contexts integrations are available.
+sentry = "0.48"
+sentry-rust-minidump = "0.16"
+# `uuid` (v4) for the anonymous install identifier — the ONLY identifier ever
+# sent to telemetry. `rand` for `before_send` non-fatal sampling.
+uuid = { version = "1", features = ["v4"] }
+rand = "0.10"
+
+# Debug-only Tauri MCP bridge — exposes the running webview to the
+# Tauri MCP server so an automation agent can inspect/manipulate the
+# DOM during development. Registered behind `cfg(debug_assertions)` in
+# `lib.rs`, so it does not ship in release builds.
+[target.'cfg(debug_assertions)'.dependencies]
+tauri-plugin-mcp-bridge = "0.11"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.25"
+core-foundation = "0.10"
+# Re-exported by core-graphics 0.25 (foreign_type! wrappers); pinned to the
+# same 0.5 so we can call `ForeignType::as_ptr` on a `CGEvent` for the direct-
+# to-pid paste post (`CGEventPostToPid`). Compatibility constraint, not "latest".
+foreign-types = "0.5"
+core-foundation-sys = "0.8"
+objc2 = "0.6"
+# `NSBundle` gates the bundle-id probe in `error_presenter` that picks the
+# native `UNUserNotificationCenter` path (shipped app) over the osascript
+# fallback (unbundled dev binary).
+objc2-foundation = { version = "0.3", features = ["NSBundle"] }
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSWorkspace", "NSRunningApplication", "NSEvent", "NSResponder", "NSApplication", "block2"] }
+# Loud-error notifications in the shipped bundle go through Apple's current
+# `UNUserNotificationCenter` API (Muni icon, click foregrounds Muni) instead
+# of the deprecated `NSUserNotification` / AppleScript helper.
+objc2-user-notifications = { version = "0.3", features = ["UNUserNotificationCenter", "UNNotificationContent", "UNNotificationRequest", "UNNotificationTrigger", "UNNotificationSound", "UNNotification", "UNNotificationResponse", "block2", "std"] }
+# Phase 9 onboarding — `AVCaptureDevice.requestAccessForMediaType:completionHandler:`
+# requires an Objective-C block. `block2` is already in the lockfile (transitive
+# dep of objc2); listing it here keeps the dependency explicit at the call site.
+block2 = "0.6"
+# Launch-at-Login via SMAppService (macOS 13+, deployment target is 14.0).
+# Replaces the deprecated AppleScript→System Events login-item path: no
+# Automation prompt, still listed under System Settings → "Open at Login".
+# `objc2`/`objc2-foundation` features gate the SMAppService class + its
+# NSError-returning register/unregister methods.
+objc2-service-management = { version = "0.3", default-features = false, features = ["std", "objc2", "objc2-foundation", "SMAppService"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "macros", "rt", "rt-multi-thread", "sync", "time", "process", "io-util"] }
+tempfile = "3"
+wiremock = "0.6"
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+# Feature 033 — retain full DWARF so Sentry can symbolicate crashes, but keep
+# the SHIPPED binary lean. `debug = "full"` emits debug info; `split-debuginfo
+# = "packed"` collects it into a separate `.dSYM` bundle; `strip = "debuginfo"`
+# strips only the debug info from the shipped binary (NOT the symbol table),
+# while the packed `.dSYM` retains the DWARF. Both share the same build-id, so
+# `sentry-cli debug-files upload` of the `.dSYM` symbolicates the stripped
+# binary's crashes. (The previous `strip = true` discarded debug info
+# entirely, leaving Sentry unable to symbolicate.)
+debug = "full"
+split-debuginfo = "packed"
+strip = "debuginfo"

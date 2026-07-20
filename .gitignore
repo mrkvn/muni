@@ -1,0 +1,46 @@
+# macOS
+.DS_Store
+
+# Claude Code working dir — nested private repo (see plan 040 Task 9)
+.claude/
+CLAUDE.local.md
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Node / pnpm
+node_modules/
+.pnpm-store/
+*.tsbuildinfo
+
+# Vite build output
+apps/*/dist/
+.vite/
+
+# Tauri / Rust build output
+apps/*/src-tauri/target/
+apps/*/src-tauri/gen/
+apps/*/src-tauri/WixTools/
+
+# IDE
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# Gemini CLI local config (per-machine)
+.gemini/
+
+# Local audio samples / spike transcripts (not committed)
+audio_sample/
+lid_spike/
+
+# Scratch / one-off notes (per-task; not committed)
+tmp/
+
+# Python bytecode (dev scripts under scripts/ are run via venv)
+__pycache__/
+*.pyc
+

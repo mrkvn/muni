@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref so a fast-follow push doesn't
+# queue behind (and eventually block on) a run that's already stale.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Frontend checks only, deliberately on ubuntu.
+  #
+  # The Rust/Tauri side needs macOS (the crate links AppKit/CoreGraphics), and
+  # macOS runner minutes are metered — they exhausted this account's included
+  # quota once already. Standard ubuntu runners are free on public repositories,
+  # so this job costs nothing while still giving an outside contributor
+  # automated feedback on a pull request.
+  #
+  # `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` are NOT run
+  # here. Run them locally before pushing:  make lint && make test
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # pnpm must be on PATH before actions/setup-node's pnpm cache step
+      # runs `pnpm store path`. Version comes from package.json's
+      # "packageManager" field.
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install JS deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm --filter desktop lint
+
+      - name: Tests
+        run: pnpm --filter desktop test

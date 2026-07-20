@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "hud",
+  "description": "Capability granted to the HUD overlay window — minimal surface",
+  "windows": ["hud"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:webview:default",
+    "core:window:default",
+    "log:default"
+  ]
+}

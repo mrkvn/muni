@@ -1,0 +1,5 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Muni-dev",
+  "identifier": "com.muni.app.dev"
+}

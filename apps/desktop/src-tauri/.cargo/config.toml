@@ -1,0 +1,15 @@
+# macOS-only cargo runner: codesigns the dev binary with the "Muni Dev"
+# identity between build and launch so macOS Accessibility / Input Monitoring
+# grants survive rebuilds. Without this, every meaningful Rust rebuild produces
+# a fresh ad-hoc signature and the user has to re-toggle the grant — see
+# `.claude/feature_plans/002` revision R5.
+#
+# `tauri build` does not invoke the runner (it uses `cargo build`). `cargo run`
+# (via `tauri dev`) does — and so does `cargo test`, which cargo runs through
+# the same runner for every test/bench harness. The runner detects that case
+# and execs those binaries directly (only the real `muni` app binary gets the
+# `.app` wrap), so `cargo test` is unaffected. Production signing still happens
+# through `tauri.conf.json bundle.macOS.signingIdentity`.
+
+[target.'cfg(target_os = "macos")']
+runner = "scripts/dev-runner.sh"

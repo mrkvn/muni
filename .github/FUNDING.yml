@@ -1,0 +1,5 @@
+# `custom` is deliberate — see .claude/runbooks/040_slice4_polar.md step 6.
+# The native `polar:` key exists, but it links to the Polar storefront page
+# rather than straight to the checkout, and the org has no project-branded
+# slug. Do not switch without revisiting that decision.
+custom: ["https://buy.polar.sh/polar_cl_uRbBQfWPjdQEcdzRJTAqzoA8NZ1w0pNiv1pum2Q2Vzw"]

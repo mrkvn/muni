@@ -54,7 +54,10 @@ fn unix_seconds_now() -> i64 {
 
 /// Schema version stamped under `app_metadata.usage.schema_version`.
 /// Bump when changing shape; never recycle a previously-shipped number.
-const CURRENT_SCHEMA_VERSION: i32 = 1;
+///
+/// - v1: `api_calls`, `price_history`, `app_metadata`.
+/// - v2: `press_timings` (plan 041 — per-press phase-timing ledger).
+const CURRENT_SCHEMA_VERSION: i32 = 2;
 
 /// `app_metadata` key holding the cost-tracking schema version.
 const SCHEMA_VERSION_KEY: &str = "usage.schema_version";
@@ -107,6 +110,24 @@ pub struct NewApiCall {
     pub status: String,
     pub request_id: Option<String>,
     pub session_id: Option<i64>,
+}
+
+/// Insert payload for `press_timings` (plan 041). One row per completed
+/// press; phase fields are `None` when the route skipped that phase (see
+/// the `press_timings` DDL note). `created_at` is the unix-seconds time
+/// of the press, `session_id` the `dictation_records` id when history
+/// persisted, else `None`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewPressTiming {
+    pub created_at: i64,
+    pub session_id: Option<i64>,
+    pub route: String,
+    pub audio_ms: Option<i64>,
+    pub asr_ms: Option<i64>,
+    pub lid_wait_ms: Option<i64>,
+    pub cleanup_ms: Option<i64>,
+    pub inject_ms: Option<i64>,
+    pub total_ms: i64,
 }
 
 /// One row of `price_history` — also the IPC shape returned by the
@@ -221,46 +242,77 @@ impl UsageStore {
             return Ok(());
         }
 
-        // Schema v1 — three tables + two indexes. Every CREATE uses
-        // `IF NOT EXISTS` so a partial earlier run that crashed
-        // between `execute_batch` and the version stamp can repeat
-        // safely.
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS api_calls (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at INTEGER NOT NULL,
-                provider TEXT NOT NULL,
-                model TEXT NOT NULL,
-                call_kind TEXT NOT NULL,
-                audio_seconds REAL,
-                input_tokens INTEGER,
-                output_tokens INTEGER,
-                cost_usd REAL,
-                latency_ms INTEGER,
-                status TEXT NOT NULL,
-                request_id TEXT,
-                session_id INTEGER REFERENCES dictation_records(id) ON DELETE SET NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_api_calls_created_at
-                ON api_calls (created_at);
-            CREATE INDEX IF NOT EXISTS idx_api_calls_provider_month
-                ON api_calls (provider, created_at);
+        // Each `current < N` block is a forward-only migration step,
+        // idempotent via `IF NOT EXISTS` so a partial earlier run that
+        // crashed between `execute_batch` and the version stamp can
+        // repeat safely. Steps run in order against both fresh DBs
+        // (`current == 0`) and any older shipped version.
 
-            CREATE TABLE IF NOT EXISTS price_history (
-                effective_month       TEXT NOT NULL,
-                provider              TEXT NOT NULL,
-                model                 TEXT NOT NULL,
-                kind                  TEXT NOT NULL,
-                usd_per_second        REAL,
-                usd_per_input_token   REAL,
-                usd_per_output_token  REAL,
-                source_url            TEXT,
-                fetched_at            INTEGER NOT NULL,
-                PRIMARY KEY (effective_month, provider, model)
-            );
-            ",
-        )?;
+        if current < 1 {
+            // Schema v1 — three tables + two indexes.
+            conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS api_calls (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    call_kind TEXT NOT NULL,
+                    audio_seconds REAL,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cost_usd REAL,
+                    latency_ms INTEGER,
+                    status TEXT NOT NULL,
+                    request_id TEXT,
+                    session_id INTEGER REFERENCES dictation_records(id) ON DELETE SET NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_api_calls_created_at
+                    ON api_calls (created_at);
+                CREATE INDEX IF NOT EXISTS idx_api_calls_provider_month
+                    ON api_calls (provider, created_at);
+
+                CREATE TABLE IF NOT EXISTS price_history (
+                    effective_month       TEXT NOT NULL,
+                    provider              TEXT NOT NULL,
+                    model                 TEXT NOT NULL,
+                    kind                  TEXT NOT NULL,
+                    usd_per_second        REAL,
+                    usd_per_input_token   REAL,
+                    usd_per_output_token  REAL,
+                    source_url            TEXT,
+                    fetched_at            INTEGER NOT NULL,
+                    PRIMARY KEY (effective_month, provider, model)
+                );
+                ",
+            )?;
+        }
+
+        if current < 2 {
+            // Schema v2 (plan 041) — per-press phase-timing ledger.
+            // Phase columns are nullable on purpose: a NULL means "that
+            // phase did not occur on this route" (e.g. `lid_wait_ms` on
+            // english-fast presses), never zero. `route` and `total_ms`
+            // are the only NOT NULL data columns — every press has both.
+            conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS press_timings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    session_id INTEGER REFERENCES dictation_records(id) ON DELETE SET NULL,
+                    route TEXT NOT NULL,
+                    audio_ms INTEGER,
+                    asr_ms INTEGER,
+                    lid_wait_ms INTEGER,
+                    cleanup_ms INTEGER,
+                    inject_ms INTEGER,
+                    total_ms INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_press_timings_created_at
+                    ON press_timings (created_at);
+                ",
+            )?;
+        }
 
         write_schema_version(conn, CURRENT_SCHEMA_VERSION)?;
         Ok(())
@@ -304,6 +356,48 @@ impl UsageStore {
         let conn = self.conn.lock().expect("usage conn poisoned");
         conn.execute(
             "DELETE FROM api_calls WHERE created_at < ?1",
+            params![cutoff],
+        )
+        .map_err(|e| UsageStoreError::Query(e.to_string()))
+    }
+
+    /// Insert a single `press_timings` row (plan 041). Returns the
+    /// generated row id. Called from inside the `persist_history`
+    /// `spawn_blocking` closure (after paste), never on the hot path.
+    pub fn insert_press_timing(&self, t: NewPressTiming) -> Result<i64, UsageStoreError> {
+        let conn = self.conn.lock().expect("usage conn poisoned");
+        conn.execute(
+            "INSERT INTO press_timings (
+                created_at, session_id, route,
+                audio_ms, asr_ms, lid_wait_ms,
+                cleanup_ms, inject_ms, total_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                t.created_at,
+                t.session_id,
+                t.route,
+                t.audio_ms,
+                t.asr_ms,
+                t.lid_wait_ms,
+                t.cleanup_ms,
+                t.inject_ms,
+                t.total_ms,
+            ],
+        )
+        .map_err(|e| UsageStoreError::Query(e.to_string()))?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Drop `press_timings` rows older than `days` (relative to "now").
+    /// Mirrors [`purge_api_calls_older_than`](Self::purge_api_calls_older_than)
+    /// and reuses [`API_CALLS_RETENTION_DAYS`]; run at launch and on
+    /// `lib.rs`'s periodic retention-purge task. Returns the number of
+    /// rows deleted.
+    pub fn purge_press_timings_older_than(&self, days: u32) -> Result<usize, UsageStoreError> {
+        let cutoff = unix_seconds_now() - (days as i64 * SECONDS_PER_DAY);
+        let conn = self.conn.lock().expect("usage conn poisoned");
+        conn.execute(
+            "DELETE FROM press_timings WHERE created_at < ?1",
             params![cutoff],
         )
         .map_err(|e| UsageStoreError::Query(e.to_string()))
@@ -679,13 +773,155 @@ mod tests {
         }
     }
 
+    /// Count rows in `sqlite_master` for a table name — a table exists
+    /// iff this returns 1.
+    fn table_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![name],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    }
+
     #[test]
-    fn fresh_db_has_tables_and_schema_version_1() {
+    fn fresh_db_has_tables_and_schema_version_2() {
         let (store, _dir) = fresh_store();
         assert_eq!(store.count_price_history().unwrap(), 0);
         let conn = store.conn.lock().unwrap();
         let v = read_schema_version(&conn).unwrap();
         assert_eq!(v, CURRENT_SCHEMA_VERSION);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 2);
+        // v2 introduced `press_timings` alongside the v1 tables.
+        assert!(table_exists(&conn, "api_calls"));
+        assert!(table_exists(&conn, "price_history"));
+        assert!(table_exists(&conn, "press_timings"));
+    }
+
+    /// An existing v1 install (api_calls/price_history present, version
+    /// stamped 1, no `press_timings`) must migrate to v2 on reopen:
+    /// `press_timings` appears and the version bumps, without disturbing
+    /// existing rows. Simulated by winding the stamped version back to 1
+    /// and dropping the v2 table, then reopening.
+    #[test]
+    fn v1_db_upgrades_to_v2_on_reopen() {
+        let dir = tempdir().expect("tempdir");
+        let path = crate::history_store::HistoryStore::default_path(dir.path());
+        let _hist = crate::history_store::HistoryStore::open(&path).expect("open history");
+
+        // Open once at current schema, seed a row, then simulate a v1 DB
+        // by dropping `press_timings` and rewinding the version stamp.
+        {
+            let store = UsageStore::open(&path).unwrap();
+            store.insert_call(sample_call(1_700_000_000)).unwrap();
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch("DROP TABLE press_timings;").unwrap();
+            write_schema_version(&conn, 1).unwrap();
+            assert!(!table_exists(&conn, "press_timings"));
+        }
+
+        // Reopen — run_migrations sees version 1 and applies the v2 step.
+        let store2 = UsageStore::open(&path).unwrap();
+        let conn = store2.conn.lock().unwrap();
+        assert_eq!(read_schema_version(&conn).unwrap(), 2);
+        assert!(table_exists(&conn, "press_timings"));
+        // The pre-existing api_calls row survived the upgrade untouched.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM api_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// The v2 migration step must be idempotent even when a *partial* v1→v2
+    /// upgrade crashed after `execute_batch` created `press_timings` but
+    /// before `write_schema_version` stamped v2 — the `IF NOT EXISTS`
+    /// promise in `run_migrations` (see the comment there). Unlike
+    /// `v1_db_upgrades_to_v2_on_reopen` (which drops the table first), this
+    /// leaves the v2 table in place and only rewinds the stamp, so reopening
+    /// re-runs `CREATE TABLE/INDEX IF NOT EXISTS` against an already-present
+    /// table — which must succeed rather than error on "table already
+    /// exists".
+    #[test]
+    fn v2_migration_is_idempotent_over_an_existing_press_timings_table() {
+        let dir = tempdir().expect("tempdir");
+        let path = crate::history_store::HistoryStore::default_path(dir.path());
+        let _hist = crate::history_store::HistoryStore::open(&path).expect("open history");
+
+        {
+            let store = UsageStore::open(&path).unwrap();
+            let conn = store.conn.lock().unwrap();
+            // Rewind the stamp WITHOUT dropping press_timings — mimics a
+            // crash between the v2 batch and the version stamp.
+            write_schema_version(&conn, 1).unwrap();
+            assert!(table_exists(&conn, "press_timings"));
+        }
+
+        // Reopen: the v2 step re-runs over the existing table and index.
+        let store2 =
+            UsageStore::open(&path).expect("v2 migration must be idempotent over existing table");
+        let conn = store2.conn.lock().unwrap();
+        assert_eq!(read_schema_version(&conn).unwrap(), 2);
+        assert!(table_exists(&conn, "press_timings"));
+    }
+
+    fn sample_timing(created_at: i64) -> NewPressTiming {
+        NewPressTiming {
+            created_at,
+            session_id: None,
+            route: "deepgram".into(),
+            audio_ms: Some(4200),
+            asr_ms: Some(380),
+            lid_wait_ms: None,
+            cleanup_ms: Some(420),
+            inject_ms: Some(35),
+            total_ms: 850,
+        }
+    }
+
+    #[test]
+    fn insert_press_timing_round_trips_with_nulls_preserved() {
+        let (store, _dir) = fresh_store();
+        let id = store
+            .insert_press_timing(sample_timing(1_779_192_000))
+            .unwrap();
+        assert!(id > 0);
+        let conn = store.conn.lock().unwrap();
+        // `lid_wait_ms` was None — it must land as SQL NULL, never 0.
+        let (route, lid, total): (String, Option<i64>, i64) = conn
+            .query_row(
+                "SELECT route, lid_wait_ms, total_ms FROM press_timings WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(route, "deepgram");
+        assert_eq!(lid, None);
+        assert_eq!(total, 850);
+    }
+
+    #[test]
+    fn purge_press_timings_keeps_recent_drops_old() {
+        let (store, _dir) = fresh_store();
+        // Recent row: insert via the public API so created_at = now.
+        let recent_id = store
+            .insert_press_timing(sample_timing(unix_seconds_now()))
+            .unwrap();
+        // Stale row: backdate 60 days via the connection directly.
+        let cutoff = unix_seconds_now() - 60 * SECONDS_PER_DAY;
+        store.insert_press_timing(sample_timing(cutoff)).unwrap();
+
+        let removed = store.purge_press_timings_older_than(30).unwrap();
+        assert_eq!(removed, 1);
+        let conn = store.conn.lock().unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM press_timings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1);
+        let surviving_id: i64 = conn
+            .query_row("SELECT id FROM press_timings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(surviving_id, recent_id);
     }
 
     #[test]

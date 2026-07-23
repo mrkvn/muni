@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use muni_lib::about_me::AboutMe;
 use muni_lib::groq::GroqClient;
+use muni_lib::groq_activity::GroqActivity;
 use muni_lib::groq_warmup::{is_enabled, spawn_cleanup_warmup, WarmupTrigger, CLEANUP_WARMUP_ENV};
 use muni_lib::history_store::HistoryStore;
 use muni_lib::pricing::DEFAULT_PRICES;
@@ -175,6 +176,7 @@ async fn warmup_posts_cleanup_shaped_body_and_writes_api_calls_row() {
         vocabulary,
         user_prompt,
         Some(tx.clone()),
+        None,
         WarmupTrigger::Boot,
     );
     handle.await.expect("warmup task joined");
@@ -194,6 +196,99 @@ async fn warmup_posts_cleanup_shaped_body_and_writes_api_calls_row() {
     assert_eq!(warmup_row.call_count, 1);
     assert_eq!(warmup_row.input_tokens, Some(120));
     assert_eq!(warmup_row.output_tokens, Some(3));
+
+    std::env::remove_var(GROQ_ENV_VAR);
+}
+
+/// Plan 041 slice-4 core invariant: a *successful* warm-up must stamp the
+/// prefix-touch clock via `note_prefix_touch`, so the periodic re-warm gate
+/// (`should_fire_periodic_rewarm`) treats the prompt-prefix cache as fresh
+/// and self-suppresses. If this stamp regresses, the periodic re-warm sees
+/// the cache as permanently stale and re-fires every tick forever —
+/// continuous wasted Groq cleanup calls (direct cost). A *failed* warm-up
+/// must NOT stamp, or a broken Groq would look permanently fresh.
+#[tokio::test]
+async fn successful_warmup_stamps_prefix_clock_and_failure_does_not() {
+    let _guard = ENV_LOCK.lock().await;
+    std::env::set_var(GROQ_ENV_VAR, TEST_API_KEY);
+    // Ensure the warm-up isn't gated off by a stray disable from another
+    // test in this process.
+    std::env::remove_var(CLEANUP_WARMUP_ENV);
+
+    // --- success: 200 SSE → prefix clock stamped ---
+    {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_body_with_usage()),
+            )
+            .mount(&server)
+            .await;
+
+        let prompt_dir = TempDir::new().unwrap();
+        let prompt = build_prompt(&prompt_dir);
+        let activity = Arc::new(GroqActivity::new());
+        assert_eq!(
+            activity.secs_since_prefix_touch(),
+            i64::MAX,
+            "a fresh activity starts unstamped"
+        );
+        let client = client_for(&server).await;
+
+        let handle = spawn_cleanup_warmup(
+            client,
+            prompt,
+            AboutMe::empty(),
+            Vocabulary::empty(),
+            UserPrompt::empty(),
+            None, // no usage writer — this test only cares about the clock
+            Some(Arc::clone(&activity)),
+            WarmupTrigger::Periodic,
+        );
+        handle.await.expect("warmup task joined");
+
+        assert!(
+            activity.secs_since_prefix_touch() < 5,
+            "a successful warm-up must stamp note_prefix_touch (got {})",
+            activity.secs_since_prefix_touch()
+        );
+    }
+
+    // --- failure: 500 → prefix clock untouched ---
+    {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let prompt_dir = TempDir::new().unwrap();
+        let prompt = build_prompt(&prompt_dir);
+        let activity = Arc::new(GroqActivity::new());
+        let client = client_for(&server).await;
+
+        let handle = spawn_cleanup_warmup(
+            client,
+            prompt,
+            AboutMe::empty(),
+            Vocabulary::empty(),
+            UserPrompt::empty(),
+            None,
+            Some(Arc::clone(&activity)),
+            WarmupTrigger::Periodic,
+        );
+        handle.await.expect("warmup task joined");
+
+        assert_eq!(
+            activity.secs_since_prefix_touch(),
+            i64::MAX,
+            "a failed warm-up must NOT stamp the prefix clock"
+        );
+    }
 
     std::env::remove_var(GROQ_ENV_VAR);
 }
@@ -234,6 +329,7 @@ async fn warmup_is_a_noop_when_api_key_missing() {
         vocabulary,
         user_prompt,
         Some(tx.clone()),
+        None,
         WarmupTrigger::Boot,
     );
     handle.await.expect("warmup task joined");

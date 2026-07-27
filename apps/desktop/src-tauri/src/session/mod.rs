@@ -38,9 +38,9 @@ use crate::groq::{self, GroqClient, GroqRequest};
 use crate::groq_activity::GroqActivity;
 use crate::groq_whisper::GroqWhisperClient;
 use crate::history_store::{
-    frontmost_app_bundle_id, HistoryStore, NewDictationRecord, SERVED_BY_DEEPGRAM_PARTIAL,
-    SERVED_BY_GLADIA_PRIMARY, SERVED_BY_GLADIA_RESCUE, SERVED_BY_PARAKEET_LOCAL,
-    SERVED_BY_WHISPER_FALLBACK,
+    frontmost_app_bundle_id, HistoryStore, NewDictationRecord, SERVED_BY_DEEPGRAM,
+    SERVED_BY_DEEPGRAM_PARTIAL, SERVED_BY_GLADIA_PRIMARY, SERVED_BY_GLADIA_RESCUE,
+    SERVED_BY_PARAKEET_LOCAL, SERVED_BY_WHISPER_FALLBACK,
 };
 use crate::injection::{FocusProbe, PlatformInjector};
 use crate::parakeet::ParakeetClient;
@@ -4351,7 +4351,7 @@ impl DictationSession {
                     }
                 };
                 active.deepgram_client.close().await;
-                Some((raw, peak, SERVED_BY_GLADIA_PRIMARY))
+                Some((raw, peak, SERVED_BY_DEEPGRAM))
             }
             RouterDecision::Whisper => {
                 // LID switched mid-press; the Deepgram client is

@@ -60,6 +60,18 @@ pub const SERVED_BY_WHISPER_FALLBACK: &str = "whisper-fallback";
 /// cloud Deepgram/Whisper paths in history and dogfood inspection.
 pub const SERVED_BY_PARAKEET_LOCAL: &str = "parakeet-local";
 
+/// A Deepgram press whose `finalize()` returned a complete transcript — the
+/// ordinary English-path success. Previously this path reported
+/// [`SERVED_BY_GLADIA_PRIMARY`], which was wrong twice over: history and the
+/// plan-041 `press_timings` ledger could not tell a Deepgram press from a
+/// Gladia one (defeating per-route latency comparison), and
+/// `telemetry::events::language_path` buckets any label containing "gladia"
+/// as `tagalog_lid`, so every English Deepgram press was reported as a
+/// Tagalog-LID press. Note the degraded sibling
+/// [`SERVED_BY_DEEPGRAM_PARTIAL`] was always tagged correctly — only the
+/// full-success arm was mislabeled.
+pub const SERVED_BY_DEEPGRAM: &str = "deepgram";
+
 /// Plan 034 — a Deepgram press whose `finalize()` handshake failed (timeout
 /// or disconnect) but for which Deepgram had already streamed `is_final`
 /// transcript chunks during the press. Those chunks are recovered and pasted
@@ -771,6 +783,29 @@ mod tests {
         let rows = store.list(None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].served_by, SERVED_BY_WHISPER_FALLBACK);
+    }
+
+    /// The Deepgram full-success label must stay distinct from the Gladia and
+    /// Whisper tags, and must contain neither substring. This is not cosmetic:
+    /// `telemetry::events::language_path` buckets any label containing
+    /// "gladia" or "whisper" as `tagalog_lid` and everything else as
+    /// `english`. Tagging the Deepgram path `gladia-primary` (the bug this
+    /// pins) reported every English press as a Tagalog-LID press, and left the
+    /// plan-041 `press_timings.route` column unable to tell the two backends
+    /// apart. The degraded sibling keeps its own tag so "complete" and
+    /// "recovered partial" stay distinguishable.
+    #[test]
+    fn deepgram_label_is_distinct_and_buckets_as_english() {
+        assert_eq!(SERVED_BY_DEEPGRAM, "deepgram");
+        assert_ne!(SERVED_BY_DEEPGRAM, SERVED_BY_DEEPGRAM_PARTIAL);
+        assert_ne!(SERVED_BY_DEEPGRAM, SERVED_BY_GLADIA_PRIMARY);
+        for label in [SERVED_BY_DEEPGRAM, SERVED_BY_DEEPGRAM_PARTIAL] {
+            let lower = label.to_ascii_lowercase();
+            assert!(
+                !lower.contains("gladia") && !lower.contains("whisper"),
+                "{label} must not bucket as tagalog_lid in telemetry"
+            );
+        }
     }
 
     #[test]

@@ -1432,6 +1432,16 @@ pub fn run() {
         // (opt-in via `MUNI_VAD_AUDIO_LID_GATE`), and the routing
         // diagnostics already fire elsewhere at INFO.
         .level_for("lid", log::LevelFilter::Debug)
+        // Plan 041 — the Groq pool keepalive is a detached background loop
+        // whose only INFO line fires once at boot ("keepalive starting").
+        // Its per-tick outcomes (`ping ok: status=…`, `skip: real Groq call
+        // within 240s`, `skip: no Groq API key`) are DEBUG, so at the global
+        // `Info` floor a wedged or misfiring keepalive would be completely
+        // silent — and it talks to a paid API every 240 s. Cost is bounded:
+        // at most one line per tick (~15/hour), and the skip line is the
+        // only evidence that real dictation traffic correctly suppresses a
+        // redundant ping.
+        .level_for("groq_keepalive", log::LevelFilter::Debug)
         // Backlog 0050 — the plugin's default `max_file_size` is 40 KB,
         // which rotates `Muni.log` mid-batch during a multi-press dogfood
         // session (observed at ~6 KB and ~23 KB during feat/026 dogfood

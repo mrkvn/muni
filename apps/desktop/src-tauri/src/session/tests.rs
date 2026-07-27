@@ -1,4 +1,8 @@
 use super::*;
+// No longer re-exported via `super::*`: production code tags Deepgram presses
+// `SERVED_BY_DEEPGRAM`, so `mod.rs` stopped importing the Gladia label. These
+// fixtures still seed rows with it to cover the legacy/Gladia-served shape.
+use crate::history_store::SERVED_BY_GLADIA_PRIMARY;
 use std::sync::Mutex;
 
 use async_trait::async_trait;

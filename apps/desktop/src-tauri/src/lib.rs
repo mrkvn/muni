@@ -1327,6 +1327,40 @@ fn effective_launch_count(on_disk: u32) -> u32 {
     on_disk.saturating_add(1)
 }
 
+/// Log targets granted DEBUG despite the global `Info` floor in [`run`].
+///
+/// Held as data rather than a chain of `.level_for(...)` calls so
+/// `lib_tests::debug_log_targets_cover_background_machinery` can assert the
+/// set. A target silently dropped from this list makes the corresponding
+/// subsystem unobservable in the shipped app while every test still passes —
+/// not hypothetical: it happened twice while dogfooding plan 041 (see
+/// `.claude/learned/035_instrumentation_is_only_as_good_as_its_observability.md`).
+///
+/// Each entry costs DEBUG output in every user's log file, so each needs a
+/// reason:
+/// - `muni` — the crate's own general diagnostics.
+/// - `lid` — feature 025's audio-LID per-window skip events and routing
+///   diagnostics; bounded, since skip lines only fire when the opt-in
+///   `MUNI_VAD_AUDIO_LID_GATE` gate is on.
+/// - `groq_keepalive` — plan 041. A detached loop whose only INFO line fires
+///   once at boot; its per-tick `ping ok` / `skip: real Groq call within 240s`
+///   outcomes are the sole evidence it still works, and it talks to a paid API
+///   every 240 s. ~15 lines/hour.
+/// - `groq_whisper` — plan 041. `audio codec=flac|wav bytes=N` is the only
+///   signal distinguishing a FLAC upload from the WAV fallback. One line per
+///   Whisper-served press.
+/// - `groq_warmup` — plan 041. The `disabled via MUNI_CACHE_REWARM=false` /
+///   `warmup disabled via MUNI_CLEANUP_WARMUP=false` / `skipping warmup: … not
+///   managed` arms are the only way to tell "opt-out honoured" from "silently
+///   broken"; the fire path already logs at INFO.
+const DEBUG_LOG_TARGETS: &[&str] = &[
+    "muni",
+    "lid",
+    "groq_keepalive",
+    "groq_whisper",
+    "groq_warmup",
+];
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Make crashes legible (and recoverable): log the panic site before the
@@ -1421,41 +1455,13 @@ pub fn run() {
     let trace_gladia = std::env::var("MUNI_TRACE_GLADIA")
         .map(|v| v.trim() == "1")
         .unwrap_or(false);
-    let mut log_builder = tauri_plugin_log::Builder::new()
-        .level(log::LevelFilter::Info)
-        .level_for("muni", log::LevelFilter::Debug)
-        // Feature 025 — the audio-LID gate's per-window skip events
-        // (`audio-LID: window skipped (vad_silent, ...)`) and routing
-        // diagnostics fire at DEBUG against the `lid` target. The
-        // global `.level(Info)` floor would otherwise drop them.
-        // Cost is bounded: skip lines only fire when the gate is on
-        // (opt-in via `MUNI_VAD_AUDIO_LID_GATE`), and the routing
-        // diagnostics already fire elsewhere at INFO.
-        .level_for("lid", log::LevelFilter::Debug)
-        // Plan 041 — the Groq pool keepalive is a detached background loop
-        // whose only INFO line fires once at boot ("keepalive starting").
-        // Its per-tick outcomes (`ping ok: status=…`, `skip: real Groq call
-        // within 240s`, `skip: no Groq API key`) are DEBUG, so at the global
-        // `Info` floor a wedged or misfiring keepalive would be completely
-        // silent — and it talks to a paid API every 240 s. Cost is bounded:
-        // at most one line per tick (~15/hour), and the skip line is the
-        // only evidence that real dictation traffic correctly suppresses a
-        // redundant ping.
-        .level_for("groq_keepalive", log::LevelFilter::Debug)
-        // Plan 041 — same rationale as the keepalive above, for the two other
-        // targets whose only evidence of a plan-041 behaviour is DEBUG:
-        //   * `groq_whisper` emits `audio codec=flac|wav bytes=N` — the sole
-        //     signal distinguishing a FLAC upload from the WAV fallback. One
-        //     line per Whisper-served press.
-        //   * `groq_warmup` emits the `disabled via MUNI_CACHE_REWARM=false` /
-        //     `warmup disabled via MUNI_CLEANUP_WARMUP=false` / `skipping
-        //     warmup: … not managed` arms — the only way to tell "opt-out
-        //     honoured" from "silently broken". The fire path already logs
-        //     `warmup ok … trigger=…` at INFO; these cover the non-fire cases.
-        // Both are low-volume: a handful at boot plus at most one per press or
-        // per 5-minute tick.
-        .level_for("groq_whisper", log::LevelFilter::Debug)
-        .level_for("groq_warmup", log::LevelFilter::Debug)
+    // Targets and their rationale live in `DEBUG_LOG_TARGETS`; applied as a
+    // loop so the set stays assertable by a regression test.
+    let mut log_builder = tauri_plugin_log::Builder::new().level(log::LevelFilter::Info);
+    for target in DEBUG_LOG_TARGETS {
+        log_builder = log_builder.level_for(*target, log::LevelFilter::Debug);
+    }
+    log_builder = log_builder
         // Backlog 0050 — the plugin's default `max_file_size` is 40 KB,
         // which rotates `Muni.log` mid-batch during a multi-press dogfood
         // session (observed at ~6 KB and ~23 KB during feat/026 dogfood
@@ -3664,6 +3670,42 @@ fn read_launch_at_login_pref(app: &AppHandle) -> bool {
 mod lib_tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Plan 041 dogfooding found the same defect twice: a subsystem whose only
+    /// runtime evidence is `log::debug!` is invisible in the shipped app unless
+    /// its target sits in [`DEBUG_LOG_TARGETS`], because `run()` sets a global
+    /// `Info` floor. Both times the full suite stayed green — the keepalive
+    /// looked identical whether it was pinging a paid API every 240 s or
+    /// wedged, and two dogfood presses exercised the FLAC upload path while
+    /// producing no observable output at all.
+    ///
+    /// This test is the guard: dropping a target from the list to "reduce log
+    /// noise" silently re-breaks that observability, and nothing else would
+    /// catch it. If you are here because this test failed, the question to
+    /// answer is "how would we detect this subsystem misbehaving in a user's
+    /// log?" — not "how do I make the test pass".
+    #[test]
+    fn debug_log_targets_cover_background_machinery() {
+        for required in ["groq_keepalive", "groq_whisper", "groq_warmup"] {
+            assert!(
+                DEBUG_LOG_TARGETS.contains(&required),
+                "`{required}` must stay in DEBUG_LOG_TARGETS — its only evidence \
+                 of correct behaviour is DEBUG, so removing it makes the \
+                 subsystem unobservable at the global Info floor"
+            );
+        }
+        // The list is an allowlist against a global floor, so a duplicate is a
+        // sign of a careless merge rather than intent to double-register.
+        let mut seen = DEBUG_LOG_TARGETS.to_vec();
+        seen.sort_unstable();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(
+            before,
+            seen.len(),
+            "DEBUG_LOG_TARGETS has a duplicate entry"
+        );
+    }
 
     #[test]
     fn arm_failure_surfaces_only_when_onboarded() {

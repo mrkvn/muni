@@ -31,7 +31,7 @@ impl DictationSession {
         served_by: &'static str,
         press_duration: Duration,
         auto_submit: bool,
-        ctx: DeliveryContext,
+        mut ctx: DeliveryContext,
     ) {
         // A recovered partial is a degraded success even when cleanup itself
         // succeeds — the upstream transcript may be truncated.
@@ -179,6 +179,13 @@ impl DictationSession {
             primary_timeout.as_millis()
         );
 
+        // Plan 041 (wave 1) — `cleanup_ms` spans the whole Groq cleanup
+        // phase: the primary attempt plus any retry. Stamped here, AFTER
+        // the cleanup-unavailable guards above (which leave `cleanup_ms`
+        // NULL because the Groq call never ran), and read at whichever
+        // terminal arm hands off to `deliver_final`.
+        let cleanup_started = Instant::now();
+
         // Primary attempt.
         let primary_err = match self
             .attempt_cleanup(
@@ -195,6 +202,8 @@ impl DictationSession {
                 let final_text = self.finalize_cleanup_text(&cleaned, stripped.as_ref());
                 self.log_cleanup_usage(usage.as_ref(), elapsed);
                 self.record_cleanup_usage(&cleanup_model, usage.as_ref(), elapsed);
+                ctx.timing
+                    .set_cleanup_ms(cleanup_started.elapsed().as_millis() as i64);
                 self.deliver_final(
                     &final_text,
                     raw_transcript,
@@ -250,6 +259,8 @@ impl DictationSession {
                 let final_text = self.finalize_cleanup_text(&cleaned, stripped.as_ref());
                 self.log_cleanup_usage(usage.as_ref(), elapsed);
                 self.record_cleanup_usage(groq::CLEANUP_RETRY_MODEL, usage.as_ref(), elapsed);
+                ctx.timing
+                    .set_cleanup_ms(cleanup_started.elapsed().as_millis() as i64);
                 self.deliver_final(
                     &final_text,
                     raw_transcript,
@@ -278,6 +289,11 @@ impl DictationSession {
                 // re-pressed and hit the same condition. The primary
                 // error is already in the log line above.
                 self.deliver_emit_error(ctx.epoch, &retry_err);
+                // Cleanup ran (both attempts) but neither served — record the
+                // wall-clock spent trying, so cold/slow cleanup outliers still
+                // show a `cleanup_ms` even on the raw-fallback path.
+                ctx.timing
+                    .set_cleanup_ms(cleanup_started.elapsed().as_millis() as i64);
                 // Primary + retry both failed — paste the marker-stripped
                 // text (self-correction ran deterministically before the
                 // cleanup attempts), not the raw transcript. `stripped` ==
@@ -376,6 +392,15 @@ impl DictationSession {
         usage: Option<&groq::UsageBlock>,
         elapsed: Duration,
     ) {
+        // Plan 041 (task 7) — a successful real cleanup just warmed
+        // Groq's prompt-prefix cache (and the connection pool). Stamp
+        // `note_prefix_touch` so the periodic re-warm knows the cache is
+        // fresh (and the keepalive knows the pool is warm). Done before
+        // the `usage_tx` guard so a disabled usage channel doesn't
+        // suppress the staleness reset.
+        if let Some(activity) = self.deps.groq_activity.as_ref() {
+            activity.note_prefix_touch();
+        }
         let Some(tx) = self.deps.usage_tx.as_ref() else {
             return;
         };
@@ -416,6 +441,13 @@ impl DictationSession {
         auto_submit: bool,
         mut ctx: DeliveryContext,
     ) {
+        // Plan 041 (wave 1) — timing anchors. `inject_started` opens the
+        // inject phase (cleanup-done → paste-delivered, INCLUDING the
+        // `await_turn` below); `press_t0` anchors `total_ms`. Captured
+        // before any await so both spans are measured whole.
+        let inject_started = Instant::now();
+        let press_t0 = ctx.press_t0;
+
         // Plan 039 task 25 — pastes must land in press order even though the
         // (slow) Groq cleanup that precedes this ran concurrently across
         // deliveries. Block until the previous press's delivery has
@@ -447,6 +479,12 @@ impl DictationSession {
             // "held" so held vs pasted is distinguishable without a new event.
             // The notice we're about to show promises exactly this row.
             let bundle_id = frontmost_app_bundle_id();
+            // Plan 041 (wave 1) — held delivery: no paste happened, so
+            // `inject_ms` stays NULL; `total_ms` still closes at the hold
+            // decision. Log the ledger line, then persist the row.
+            let mut timing = std::mem::take(&mut ctx.timing);
+            timing.set_total_ms(press_t0.elapsed().as_millis() as i64);
+            timing.log_line();
             self.record_completion(
                 self.deps.history.clone(),
                 raw_for_history,
@@ -455,6 +493,7 @@ impl DictationSession {
                 &metrics,
                 bundle_id,
                 crate::telemetry::events::DELIVERY_HELD,
+                timing,
             );
             // Surface the dynamic "Press <hotkey> to insert your dictation"
             // notice. No paste, and never an auto-Enter.
@@ -493,6 +532,13 @@ impl DictationSession {
                 // Resolve the frontmost app once, shared by the history row
                 // and the telemetry event so both attribute the same target.
                 let bundle_id = frontmost_app_bundle_id();
+                // Plan 041 (wave 1) — paste landed: close the inject phase
+                // (cleanup-done → here, incl. `await_turn`) and `total_ms`,
+                // log the ledger line, then persist the row.
+                let mut timing = std::mem::take(&mut ctx.timing);
+                timing.set_inject_ms(inject_started.elapsed().as_millis() as i64);
+                timing.set_total_ms(press_t0.elapsed().as_millis() as i64);
+                timing.log_line();
                 self.record_completion(
                     self.deps.history.clone(),
                     raw_for_history,
@@ -501,6 +547,7 @@ impl DictationSession {
                     &metrics,
                     bundle_id,
                     crate::telemetry::events::DELIVERY_PASTED,
+                    timing,
                 );
                 self.deliver_notify_state(ctx.epoch, SessionState::Idle);
             }
@@ -546,8 +593,16 @@ impl DictationSession {
         metrics: &CompletionMetrics,
         bundle_id: Option<String>,
         delivery: &'static str,
+        timing: PressTiming,
     ) {
-        self.persist_history(store, raw_for_history, text, served_by, bundle_id.clone());
+        self.persist_history(
+            store,
+            raw_for_history,
+            text,
+            served_by,
+            bundle_id.clone(),
+            timing,
+        );
         // Feature 033 — fire-and-forget operational-health event. Built from
         // metadata only (timings, model, buckets, served_by, the bucketed
         // target app, the delivery outcome); the char COUNT is taken here,
@@ -582,6 +637,7 @@ impl DictationSession {
         cleaned: &str,
         served_by: &str,
         bundle_id: Option<String>,
+        timing: PressTiming,
     ) {
         let Some(history) = store else {
             return;
@@ -597,6 +653,15 @@ impl DictationSession {
         // the spawned closure). EventEmitter is Arc-internally so the
         // clone is cheap.
         let emitter = self.deps.emitter.clone();
+        // Plan 041 (wave 1) — persist the press-timing row in the SAME
+        // blocking task as the history insert. This is the only place the
+        // `dictation_records` id exists, keeps both SQLite writes off the
+        // async runtime, and runs strictly AFTER paste (nothing here is on
+        // the hot path). `None` usage store (failed to open at boot, or
+        // tests) → skip the row; the ledger log line already fired in
+        // `deliver_final`, so the press is never invisible.
+        let usage_store = self.deps.usage_store.clone();
+        let created_at = unix_seconds_now();
         // Spawn a blocking task so the SQLite write doesn't park a
         // tokio worker. The store itself is `Send + Sync`; we only
         // need the blocking spawn for the sync rusqlite call.
@@ -604,8 +669,34 @@ impl DictationSession {
             Ok(id) => {
                 log::debug!(target: "history", "inserted record id={id}");
                 emitter(EVENT_HISTORY_CHANGED, String::new());
+                persist_press_timing(usage_store.as_ref(), timing, Some(id), created_at);
             }
-            Err(err) => log::warn!(target: "history", "insert failed: {err}"),
+            Err(err) => {
+                log::warn!(target: "history", "insert failed: {err}");
+                // History failed, but the timing data stands on its own —
+                // persist it with a NULL `session_id` rather than losing it.
+                persist_press_timing(usage_store.as_ref(), timing, None, created_at);
+            }
         });
+    }
+}
+
+/// Insert one `press_timings` row via the cost-tracking store (plan 041).
+/// A `None` store (failed to open at boot / tests) is a silent no-op — the
+/// ledger log line already fired at the call site. Runs inside the
+/// `persist_history` `spawn_blocking` closure, never on the hot path.
+fn persist_press_timing(
+    usage_store: Option<&Arc<UsageStore>>,
+    timing: PressTiming,
+    session_id: Option<i64>,
+    created_at: i64,
+) {
+    let Some(store) = usage_store else {
+        return;
+    };
+    if let Err(err) =
+        store.insert_press_timing(timing.into_new_press_timing(session_id, created_at))
+    {
+        log::warn!(target: "press_timing", "insert failed: {}", err.user_message());
     }
 }

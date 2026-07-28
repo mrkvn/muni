@@ -363,6 +363,29 @@ pub(crate) fn parse_groq_endpoint(raw: Option<String>) -> String {
         .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string())
 }
 
+/// Build the single `reqwest::Client` shared by all three Groq clients
+/// (cleanup, Whisper, LID) plus the pool keepalive. Plan 041 (task 6).
+///
+/// Sets ONLY `pool_idle_timeout(300s)` and nothing else — critically,
+/// NO builder-level timeout. Each Groq client applies its own
+/// per-request `.timeout(...)` at the call site (cleanup 8 s, Whisper
+/// 5 s, LID 6 s), so one pooled client serves all three timeout
+/// profiles without cross-contamination. `reqwest::Client` is `Arc`
+/// internally: cloning the returned client shares the same connection
+/// pool, which is the entire point — never wrap it in another `Arc`.
+///
+/// Default reqwest `pool_idle_timeout` is 90 s — too short for the
+/// realistic "save a setting, then dictate a few minutes later"
+/// pattern; 5 min keeps the warmed connection alive across that gap.
+pub fn shared_groq_http() -> Result<reqwest::Client, MuniError> {
+    reqwest::Client::builder()
+        .pool_idle_timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|e| MuniError::GroqConnectionFailed {
+            reason: e.to_string(),
+        })
+}
+
 /// Resolve the cleanup `reasoning_effort` from the env. Returns
 /// [`DEFAULT_REASONING_EFFORT`] when [`CLEANUP_REASONING_EFFORT_ENV`]
 /// is unset, empty, whitespace-only, or set to a value outside the
@@ -588,26 +611,36 @@ impl GroqClient {
         endpoint: String,
         cleanup_model: String,
     ) -> Result<Self, MuniError> {
-        // Default reqwest `pool_idle_timeout` is 90 s — too short for
-        // the realistic "save a setting in Settings, then dictate a
-        // few minutes later" pattern. Bumping to 5 min keeps the
-        // TLS-warm half of the cleanup warm-up alive across that gap.
-        // Worst case (NAT/server-side close mid-window): reqwest
-        // transparently retries with a fresh connection, costing one
-        // extra round-trip on that one press — same as a cold start
-        // would have been. No user-visible regression possible.
-        let http = reqwest::Client::builder()
-            .pool_idle_timeout(Duration::from_secs(300))
-            .build()
-            .map_err(|e| MuniError::GroqConnectionFailed {
-                reason: e.to_string(),
-            })?;
-        Ok(Self {
+        // Builds a private client with the shared-pool config so the
+        // standalone construction path (tests, dev, boot-fallback when
+        // the shared client failed to build) behaves exactly as before
+        // plan 041. Production threads one [`shared_groq_http`] client
+        // through [`Self::with_http_client`] so all three Groq clients
+        // share a single connection pool.
+        let http = shared_groq_http()?;
+        Ok(Self::with_http_client(http, endpoint, cleanup_model))
+    }
+
+    /// Construct a client around an already-built `reqwest::Client`.
+    /// Plan 041 (task 6) — lets `lib.rs` build ONE [`shared_groq_http`]
+    /// client and hand a clone to every Groq client so they share a
+    /// single TCP/TLS connection pool. `reqwest::Client` is internally
+    /// `Arc`; clones share the pool, so no extra `Arc` wrapping is
+    /// needed (or wanted). The per-request timeout is still applied at
+    /// each call site ([`Self::complete_with_timeout`]), never on the
+    /// builder — that absence is what makes one pooled client safe to
+    /// share across clients with different timeout profiles.
+    pub fn with_http_client(
+        http: reqwest::Client,
+        endpoint: String,
+        cleanup_model: String,
+    ) -> Self {
+        Self {
             endpoint,
             cleanup_model,
             http,
             timeout: DEFAULT_TIMEOUT,
-        })
+        }
     }
 
     /// The model id this client uses for cleanup requests. Resolved

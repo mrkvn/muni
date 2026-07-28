@@ -35,18 +35,21 @@ use crate::error::MuniError;
 use crate::error_presenter::PresentError;
 use crate::gladia::GladiaClient;
 use crate::groq::{self, GroqClient, GroqRequest};
+use crate::groq_activity::GroqActivity;
 use crate::groq_whisper::GroqWhisperClient;
 use crate::history_store::{
-    frontmost_app_bundle_id, HistoryStore, NewDictationRecord, SERVED_BY_DEEPGRAM_PARTIAL,
-    SERVED_BY_GLADIA_PRIMARY, SERVED_BY_GLADIA_RESCUE, SERVED_BY_PARAKEET_LOCAL,
+    frontmost_app_bundle_id, HistoryStore, NewDictationRecord, SERVED_BY_DEEPGRAM,
+    SERVED_BY_DEEPGRAM_PARTIAL, SERVED_BY_GLADIA_RESCUE, SERVED_BY_PARAKEET_LOCAL,
     SERVED_BY_WHISPER_FALLBACK,
 };
 use crate::injection::{FocusProbe, PlatformInjector};
 use crate::parakeet::ParakeetClient;
 use crate::permissions::{self, MicrophoneStatus};
+use crate::press_timing::PressTiming;
 use crate::prompt::CleanupPrompt;
 use crate::secrets;
 use crate::text_lid::{LidLabel, TextLidClassifier};
+use crate::usage_store::UsageStore;
 use crate::usage_writer::{try_send_drop_oldest, UsageRecord};
 
 // Plan 039 slice 25: the Deepgram pre-warming pool moved verbatim to
@@ -1464,6 +1467,21 @@ pub struct SessionDeps {
     /// writer freezes a `cost_usd` and inserts an `api_calls` row.
     /// `None` in tests so the harness doesn't have to spin a writer.
     pub usage_tx: Option<mpsc::Sender<UsageRecord>>,
+    /// Plan 041 (wave 1) — the cost-tracking store, shared with the
+    /// [`crate::usage_writer`]. Reused by the delivery tail to persist
+    /// one `press_timings` row per completed press, inside the existing
+    /// `persist_history` `spawn_blocking` closure (after paste, off the
+    /// hot path). `None` in tests + when the store failed to open at
+    /// boot — in that case the `press_timing` log line still fires but
+    /// no row is written.
+    pub usage_store: Option<Arc<UsageStore>>,
+    /// Plan 041 (task 7) — shared Groq activity tracker. The delivery
+    /// tail bumps `note_prefix_touch` after a successful real cleanup
+    /// (that warms Groq's prompt-prefix cache) and the Whisper path
+    /// bumps `note_call` after a successful transcribe, feeding the
+    /// keepalive skip-gate and the periodic cache re-warm. `None` in
+    /// tests + when the tracker isn't managed (never in production).
+    pub groq_activity: Option<Arc<GroqActivity>>,
     /// Feature 013 — deterministic per-user substitution layer applied
     /// to the raw transcript between trim and Groq cleanup. See
     /// [`crate::my_words`] for the matcher semantics. Always present;
@@ -2386,6 +2404,13 @@ struct PressShared {
 struct DeliveryContext {
     order: Option<oneshot::Receiver<()>>,
     epoch: Option<u64>,
+    /// Plan 041 (wave 1) — release timestamp (`press_t0`) so the delivery
+    /// tail can compute `total_ms = press_t0.elapsed()` at paste-delivered.
+    press_t0: Instant,
+    /// Plan 041 (wave 1) — the release-time timing skeleton, filled with
+    /// `cleanup_ms` by `run_groq_cleanup` and `inject_ms`/`total_ms` by
+    /// `deliver_final`, then logged + persisted.
+    timing: PressTiming,
 }
 
 impl DeliveryContext {
@@ -2397,6 +2422,8 @@ impl DeliveryContext {
         Self {
             order: None,
             epoch: None,
+            press_t0: Instant::now(),
+            timing: PressTiming::default(),
         }
     }
 
@@ -3377,6 +3404,10 @@ impl DictationSession {
         self: &Arc<Self>,
         auto_submit: bool,
     ) -> Option<JoinHandle<()>> {
+        // Plan 041 (wave 1) — t₀ for the per-press timing ledger. Stamped
+        // at the very entry so `total_ms` covers the whole release path.
+        // Pure `Instant::now()`; nothing here awaits before the branch.
+        let press_t0 = Instant::now();
         let state = {
             let mut g = self.active.lock().await;
             g.take()
@@ -3420,6 +3451,11 @@ impl DictationSession {
         // tag, also the
         // migration default for pre-v2 rows; the legacy LID routes never had a
         // fallback tag and live on as "primary".
+        // Plan 041 (wave 1) — `lid_wait` is the summed release-path
+        // LID-settle wait. `None` stays `None` on routes that never enter
+        // `finalize_auto_detect` (Deepgram/english-fast, Whisper batch),
+        // so those presses record `lid_wait_ms = NULL`, not 0.
+        let mut lid_wait: Option<Duration> = None;
         let (raw_transcript, peak_amplitude, served_by) = match state {
             ActiveSession::Deepgram(active) => match self.finalize_deepgram(active).await {
                 Some((raw, peak, served_by)) => (raw, peak, served_by),
@@ -3428,7 +3464,11 @@ impl DictationSession {
             ActiveSession::AutoDetect(active) => {
                 // `finalize_auto_detect` returns its own `served_by` tag so the
                 // Parakeet local arm can be distinguished from Deepgram/Whisper.
-                match self.finalize_auto_detect(active, press_duration).await {
+                // It also accumulates the three LID-settle waits into `lid_wait`.
+                match self
+                    .finalize_auto_detect(active, press_duration, &mut lid_wait)
+                    .await
+                {
                     Some((raw, peak, served_by)) => (raw, peak, served_by),
                     None => return None,
                 }
@@ -3442,6 +3482,10 @@ impl DictationSession {
                 }
             }
         };
+        // ASR span: release → raw transcript ready (measured across whichever
+        // finalize route ran). `audio_ms` mirrors the telemetry
+        // `audio_duration_ms` source (the press's wall-clock duration).
+        let asr_ms = press_t0.elapsed().as_millis() as i64;
 
         let trimmed = raw_transcript.trim();
         // Feature 023 (backlog 0040) — known Whisper hallucination
@@ -3548,9 +3592,22 @@ impl DictationSession {
             tail.replace(done_rx)
         };
         let epoch = self.press_epoch.load(Ordering::SeqCst);
+        // Plan 041 (wave 1) — release-time timing skeleton. `route` is the
+        // committed served-by label; `audio_ms` mirrors the telemetry
+        // press-duration source; `asr_ms` and `lid_wait_ms` are already
+        // measured above. `cleanup_ms`/`inject_ms`/`total_ms` are filled
+        // by the delivery tail as those phases complete.
+        let timing = PressTiming::new(
+            served_by,
+            Some(press_duration.as_millis() as i64),
+            Some(asr_ms),
+            lid_wait.map(|d| d.as_millis() as i64),
+        );
         let ctx = DeliveryContext {
             order: predecessor,
             epoch: Some(epoch),
+            press_t0,
+            timing,
         };
 
         let this = Arc::clone(self);
@@ -3723,7 +3780,7 @@ impl DictationSession {
             }
         };
         active.client.close().await;
-        Some((raw, peak, SERVED_BY_GLADIA_PRIMARY))
+        Some((raw, peak, SERVED_BY_DEEPGRAM))
     }
 
     /// Emit a [`UsageRecord`] for a successful Deepgram press.
@@ -3822,7 +3879,15 @@ impl DictationSession {
         &self,
         active: AutoDetectActive,
         press_duration: Duration,
+        lid_wait_out: &mut Option<Duration>,
     ) -> Option<(String, i16, &'static str)> {
+        // Plan 041 (wave 1) — this route DOES pay a LID-settle wait (the
+        // `wait_for_decision` below always runs), so mark the phase as
+        // occurring: `Some(0)` rather than `None`. The three settle sites
+        // accumulate into this in place, so every early return carries the
+        // waits measured so far; `None` is reserved for routes that never
+        // reach this function.
+        *lid_wait_out = Some(Duration::ZERO);
         // Feature 019 — release-drain window. If the confidence trigger
         // was armed (i.e. pass#2 committed Deepgram and the trigger task
         // is monitoring per-chunk confidence), Deepgram may still be
@@ -3882,8 +3947,13 @@ impl DictationSession {
         // Wait briefly for the LID task to land. If it already has,
         // `notified()` returns immediately; if not we cap at
         // `RELEASE_LID_WAIT`.
+        let settle_started = Instant::now();
         let (notified, snapshot) =
             wait_for_decision(&active.decision_notify, &active.decision, RELEASE_LID_WAIT).await;
+        // Plan 041 (wave 1) — first settle site: the primary decision wait.
+        if let Some(w) = lid_wait_out.as_mut() {
+            *w += settle_started.elapsed();
+        }
 
         let mut chosen = match snapshot {
             Some(d) => d,
@@ -3934,7 +4004,12 @@ impl DictationSession {
                     active.decision_notify.notified(),
                 )
                 .await;
-                let elapsed_ms = started.elapsed().as_millis();
+                let elapsed = started.elapsed();
+                let elapsed_ms = elapsed.as_millis();
+                // Plan 041 (wave 1) — second settle site: confidence-trigger wait.
+                if let Some(w) = lid_wait_out.as_mut() {
+                    *w += elapsed;
+                }
                 let new_snapshot = *active.decision.lock().await;
                 if matches!(new_snapshot, Some(RouterDecision::Whisper)) {
                     chosen = RouterDecision::Whisper;
@@ -3998,7 +4073,12 @@ impl DictationSession {
                 Duration::from_millis(TRIGGER_REPASS_WAIT_MS),
             )
             .await;
-            let elapsed_ms = started.elapsed().as_millis();
+            let elapsed = started.elapsed();
+            let elapsed_ms = elapsed.as_millis();
+            // Plan 041 (wave 1) — third settle site: audio-LID hybrid wait.
+            if let Some(w) = lid_wait_out.as_mut() {
+                *w += elapsed;
+            }
             let inflight_at_end = active.audio_hybrid_inflight.load(Ordering::SeqCst);
             if flipped {
                 chosen = RouterDecision::Whisper;
@@ -4271,7 +4351,7 @@ impl DictationSession {
                     }
                 };
                 active.deepgram_client.close().await;
-                Some((raw, peak, SERVED_BY_GLADIA_PRIMARY))
+                Some((raw, peak, SERVED_BY_DEEPGRAM))
             }
             RouterDecision::Whisper => {
                 // LID switched mid-press; the Deepgram client is
@@ -4495,6 +4575,13 @@ impl DictationSession {
                 );
                 self.emit(EVENT_TRANSCRIPT_RAW, transcript.clone());
                 self.record_groq_whisper_usage(trim_buffer.len(), elapsed, "ok");
+                // Plan 041 (task 7) — a successful Groq Whisper call kept
+                // the shared pool warm; note it so the keepalive can skip
+                // a redundant ping. Not a prefix-touch: Whisper doesn't
+                // warm the cleanup prompt cache.
+                if let Some(activity) = self.deps.groq_activity.as_ref() {
+                    activity.note_call();
+                }
                 Some((transcript, peak, SERVED_BY_WHISPER_FALLBACK))
             }
             Err(err) => {

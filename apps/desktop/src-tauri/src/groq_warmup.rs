@@ -42,13 +42,14 @@
 //! comparison only.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager, Runtime};
 use tokio::sync::mpsc::Sender;
 
 use crate::about_me::AboutMe;
 use crate::groq::{GroqClient, GroqRequest};
+use crate::groq_activity::GroqActivity;
 use crate::pricing::{CALL_KIND_CLEANUP_WARMUP, PROVIDER_GROQ};
 use crate::prompt::CleanupPrompt;
 use crate::secrets;
@@ -89,6 +90,11 @@ pub enum WarmupTrigger {
     /// onboarding wizard). Covers the case where the boot trigger
     /// was a no-op because no key was present yet.
     KeySaved,
+    /// Plan 041 (slice 4) periodic staleness tick: the prompt-prefix
+    /// cache went idle for ≥ 90 min and [`spawn_periodic_rewarm`]
+    /// fired a re-warm to pre-empt the ~2.85s cold-cache tax on the
+    /// user's next press.
+    Periodic,
 }
 
 impl WarmupTrigger {
@@ -102,6 +108,7 @@ impl WarmupTrigger {
             Self::Vocabulary => "vocab",
             Self::UserPrompt => "user_prompt",
             Self::KeySaved => "key_saved",
+            Self::Periodic => "periodic",
         }
     }
 }
@@ -119,6 +126,114 @@ pub fn is_enabled() -> bool {
         .unwrap_or(false)
 }
 
+// ---------------------------------------------------------------------
+// Plan 041 (slice 4) — periodic prompt-cache re-warm.
+//
+// Groq evicts the per-account prompt-prefix cache after 2h of
+// inactivity (~2.85s cold-cache tax measured, vs a 384ms warm floor).
+// A 5-minute staleness tick that fires a re-warm once the cache has
+// been idle ≥ 90 min keeps that tax off the user's next press without
+// polling so aggressively that it wastes API calls. The 5-min-tick /
+// 90-min-threshold split (rather than one long sleep) is deliberate:
+// it self-heals across Mac sleep — a laptop that wakes from a 3h nap
+// finds the very next tick already stale and fires immediately,
+// instead of waiting out a timer that was scheduled before the sleep.
+// ---------------------------------------------------------------------
+
+/// Env var that disables the periodic cache re-warm at its spawn site.
+/// Default behaviour (unset / any other value) is "re-warm enabled."
+/// Independent of [`CLEANUP_WARMUP_ENV`] — that flag still gates
+/// [`warmup_from_app`] itself (see [`should_fire_periodic_rewarm`]), so
+/// disabling cleanup warm-up entirely also silences the periodic tick.
+pub const CACHE_REWARM_ENV: &str = "MUNI_CACHE_REWARM";
+
+/// How often the periodic re-warm checks staleness. Short relative to
+/// the 90-min fire threshold so the self-heal-across-sleep property
+/// holds without meaningfully polling `secs_since_prefix_touch()` (an
+/// atomic load) more than necessary.
+const REWARM_TICK_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Staleness threshold: fire a re-warm once the prompt-prefix cache has
+/// gone this long without a real cleanup-shaped touch. Comfortably
+/// inside Groq's 2h eviction window so the re-warm always lands before
+/// the cache actually evicts.
+const REWARM_STALENESS_THRESHOLD_SECS: i64 = 90 * 60;
+
+/// Read `MUNI_CACHE_REWARM` and return `false` only when it is
+/// explicitly set to `"false"` (case-insensitive, trim-ws). Mirrors
+/// [`is_enabled`] — default enabled.
+pub fn is_rewarm_enabled() -> bool {
+    !std::env::var(CACHE_REWARM_ENV)
+        .map(|v| v.trim().eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+}
+
+/// Pure staleness gate: has the prompt-prefix cache gone idle long
+/// enough to warrant a re-warm? Extracted so the 89min/90min boundary
+/// is unit-testable without spinning up a timer or a Tauri app.
+fn is_prefix_stale(secs_since_prefix_touch: i64) -> bool {
+    secs_since_prefix_touch >= REWARM_STALENESS_THRESHOLD_SECS
+}
+
+/// Whether one periodic tick should fire a re-warm: both the
+/// `MUNI_CACHE_REWARM` opt-out AND the staleness gate must agree.
+/// Extracted from the tick loop so tests can drive both flags and the
+/// gate math directly, without an `AppHandle`.
+fn should_fire_periodic_rewarm(activity: &GroqActivity) -> bool {
+    if !is_rewarm_enabled() {
+        log::debug!(
+            target: "groq_warmup",
+            "periodic re-warm disabled via {CACHE_REWARM_ENV}=false"
+        );
+        return false;
+    }
+    is_prefix_stale(activity.secs_since_prefix_touch())
+}
+
+/// Spawn the detached periodic re-warm task. Runs for the lifetime of
+/// the process; the caller drops the returned `JoinHandle` on the floor
+/// (mirrors [`crate::groq_keepalive::spawn`] and
+/// [`crate::prices_refresher::spawn`]).
+///
+/// `activity` is the SAME [`GroqActivity`] instance a real press's
+/// cleanup call touches via `note_prefix_touch` — reading a clone would
+/// observe a clock that never moves.
+pub fn spawn_periodic_rewarm<R: Runtime>(
+    app: AppHandle<R>,
+    activity: Arc<GroqActivity>,
+) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        run_periodic_rewarm(app, activity).await;
+    })
+}
+
+/// Task body: 5-minute interval loop that checks staleness each tick
+/// (subject to the [`should_fire_periodic_rewarm`] gate) and, when due,
+/// calls [`warmup_from_app`] with [`WarmupTrigger::Periodic`].
+/// `warmup_from_app`'s internal `MUNI_CLEANUP_WARMUP` gate stays
+/// authoritative — both flags apply, this loop just adds the
+/// staleness/opt-out check on top.
+async fn run_periodic_rewarm<R: Runtime>(app: AppHandle<R>, activity: Arc<GroqActivity>) {
+    log::info!(
+        target: "groq_warmup",
+        "periodic re-warm starting (tick={}s stale_threshold={}s)",
+        REWARM_TICK_INTERVAL.as_secs(),
+        REWARM_STALENESS_THRESHOLD_SECS
+    );
+    let mut ticker = tokio::time::interval(REWARM_TICK_INTERVAL);
+    // Consume the immediate first tick — `tokio::time::interval` fires
+    // at t=0, and the boot warm-up (if any) just stamped
+    // `last_prefix_touch`; checking staleness before a full tick has
+    // elapsed would be a redundant no-op at best.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        if should_fire_periodic_rewarm(&activity) {
+            warmup_from_app(&app, WarmupTrigger::Periodic);
+        }
+    }
+}
+
 /// Spawn the detached warm-up task. Caller drops the returned join
 /// handle on the floor — the task is fire-and-forget; never blocks
 /// the caller and never panics.
@@ -128,6 +243,7 @@ pub fn is_enabled() -> bool {
 /// read happens once per trigger rather than once per task body
 /// (cheap, but the explicit gate also documents the off-switch at
 /// each call site).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_cleanup_warmup(
     client: Arc<GroqClient>,
     prompt: Arc<CleanupPrompt>,
@@ -135,6 +251,7 @@ pub fn spawn_cleanup_warmup(
     vocabulary: Arc<Vocabulary>,
     user_prompt: Arc<UserPrompt>,
     usage_tx: Option<Sender<UsageRecord>>,
+    activity: Option<Arc<GroqActivity>>,
     trigger: WarmupTrigger,
 ) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
@@ -145,6 +262,7 @@ pub fn spawn_cleanup_warmup(
             vocabulary,
             user_prompt,
             usage_tx,
+            activity,
             trigger,
         )
         .await;
@@ -210,6 +328,13 @@ pub fn warmup_from_app<R: Runtime>(app: &AppHandle<R>, trigger: WarmupTrigger) {
     let usage_tx = app
         .try_state::<Sender<UsageRecord>>()
         .map(|s| s.inner().clone());
+    // Plan 041 (task 7) — pull the shared activity tracker so the
+    // warm-up's success arm can stamp `note_prefix_touch` and close the
+    // re-warm staleness loop. Absent in tests / early boot → the
+    // warm-up still runs, it just doesn't reset the clock.
+    let activity = app
+        .try_state::<Arc<GroqActivity>>()
+        .map(|a| Arc::clone(a.inner()));
 
     drop(spawn_cleanup_warmup(
         Arc::clone(client.inner()),
@@ -218,6 +343,7 @@ pub fn warmup_from_app<R: Runtime>(app: &AppHandle<R>, trigger: WarmupTrigger) {
         Arc::clone(vocabulary.inner()),
         Arc::clone(user_prompt.inner()),
         usage_tx,
+        activity,
         trigger,
     ));
 }
@@ -225,6 +351,7 @@ pub fn warmup_from_app<R: Runtime>(app: &AppHandle<R>, trigger: WarmupTrigger) {
 /// Inner body of the warm-up task. Extracted from `spawn_cleanup_warmup`
 /// so the await chain is unit-testable without going through
 /// `tauri::async_runtime::spawn`.
+#[allow(clippy::too_many_arguments)]
 async fn run_warmup_inner(
     client: Arc<GroqClient>,
     prompt: Arc<CleanupPrompt>,
@@ -232,6 +359,7 @@ async fn run_warmup_inner(
     vocabulary: Arc<Vocabulary>,
     user_prompt: Arc<UserPrompt>,
     usage_tx: Option<Sender<UsageRecord>>,
+    activity: Option<Arc<GroqActivity>>,
     trigger: WarmupTrigger,
 ) {
     let api_key = match secrets::get(secrets::GROQ_ACCOUNT) {
@@ -276,6 +404,13 @@ async fn run_warmup_inner(
     let request = GroqRequest::cleanup(messages, &cleanup_model);
     match client.complete(request, &api_key).await {
         Ok((_cleaned, usage)) => {
+            // Plan 041 (task 7) — a successful warm-up warmed Groq's
+            // prompt-prefix cache; stamp the staleness clock so the
+            // periodic re-warm (slice 4) knows the cache is fresh and
+            // won't re-fire until it goes stale again.
+            if let Some(activity) = activity.as_ref() {
+                activity.note_prefix_touch();
+            }
             let elapsed = started.elapsed();
             let prompt_tokens = usage.map(|u| u.prompt_tokens);
             let completion_tokens = usage.map(|u| u.completion_tokens);
@@ -382,5 +517,89 @@ mod tests {
         assert_eq!(WarmupTrigger::AboutMe.as_log_str(), "about_me");
         assert_eq!(WarmupTrigger::Vocabulary.as_log_str(), "vocab");
         assert_eq!(WarmupTrigger::KeySaved.as_log_str(), "key_saved");
+        assert_eq!(WarmupTrigger::Periodic.as_log_str(), "periodic");
+    }
+
+    /// `MUNI_CACHE_REWARM` is also a process-global resource; reuses the
+    /// same `ENV_LOCK` since these tests never run concurrently with the
+    /// `MUNI_CLEANUP_WARMUP` tests above (both share one test binary's
+    /// serial env-mutation discipline).
+    #[test]
+    fn is_rewarm_enabled_defaults_to_true_when_env_unset() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var(CACHE_REWARM_ENV);
+        assert!(is_rewarm_enabled());
+    }
+
+    #[test]
+    fn is_rewarm_enabled_respects_explicit_false() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for value in ["false", "FALSE", "  false  ", "fAlSe"] {
+            std::env::set_var(CACHE_REWARM_ENV, value);
+            assert!(
+                !is_rewarm_enabled(),
+                "MUNI_CACHE_REWARM={value:?} should disable the periodic re-warm"
+            );
+        }
+        std::env::remove_var(CACHE_REWARM_ENV);
+    }
+
+    #[test]
+    fn is_rewarm_enabled_treats_other_values_as_true() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for value in ["true", "1", "", "yes", "no", "0", "off", "garbage"] {
+            std::env::set_var(CACHE_REWARM_ENV, value);
+            assert!(is_rewarm_enabled(), "only explicit `false` disables");
+        }
+        std::env::remove_var(CACHE_REWARM_ENV);
+    }
+
+    #[test]
+    fn is_prefix_stale_boundary_is_90_minutes() {
+        // 89 minutes idle: not yet stale.
+        assert!(!is_prefix_stale(89 * 60));
+        // Exactly 90 minutes: fires.
+        assert!(is_prefix_stale(90 * 60));
+        // Well past threshold: fires.
+        assert!(is_prefix_stale(3 * 60 * 60));
+        // Never touched (i64::MAX sentinel): always fires.
+        assert!(is_prefix_stale(i64::MAX));
+    }
+
+    #[test]
+    fn should_fire_periodic_rewarm_gates_on_staleness_and_flag() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var(CACHE_REWARM_ENV);
+
+        let activity = GroqActivity::new();
+        // Fresh tracker (never touched) reads as maximally stale — fires.
+        assert!(should_fire_periodic_rewarm(&activity));
+
+        // 89 min idle: gate math says skip.
+        activity.seed_last_prefix_touch_unix(now_unix() - 89 * 60);
+        assert!(!should_fire_periodic_rewarm(&activity));
+
+        // 90 min idle: gate math says fire.
+        activity.seed_last_prefix_touch_unix(now_unix() - 90 * 60);
+        assert!(should_fire_periodic_rewarm(&activity));
+
+        // A fresh touch (as a successful warmup would stamp) suppresses
+        // the next check until stale again.
+        activity.note_prefix_touch();
+        assert!(!should_fire_periodic_rewarm(&activity));
+
+        // Even when stale, MUNI_CACHE_REWARM=false must suppress firing.
+        activity.seed_last_prefix_touch_unix(now_unix() - 90 * 60);
+        std::env::set_var(CACHE_REWARM_ENV, "false");
+        assert!(!should_fire_periodic_rewarm(&activity));
+
+        std::env::remove_var(CACHE_REWARM_ENV);
+    }
+
+    fn now_unix() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
     }
 }

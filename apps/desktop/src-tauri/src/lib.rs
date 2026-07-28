@@ -29,6 +29,8 @@ pub mod error_presenter;
 pub mod gemini_lid;
 pub mod gladia;
 pub mod groq;
+pub mod groq_activity;
+pub mod groq_keepalive;
 pub mod groq_lid;
 pub mod groq_warmup;
 pub mod groq_whisper;
@@ -41,6 +43,7 @@ pub mod launch_item;
 pub mod my_words;
 pub mod parakeet;
 pub mod permissions;
+pub mod press_timing;
 pub mod prices_client;
 pub mod prices_refresher;
 pub mod pricing;
@@ -67,6 +70,7 @@ use error::MuniError;
 use error_presenter::app_handle_presenter;
 use gemini_lid::GeminiLidClient;
 use groq::GroqClient;
+use groq_activity::GroqActivity;
 use groq_lid::GroqLidClient;
 use groq_whisper::GroqWhisperClient;
 use history_store::HistoryStore;
@@ -1323,6 +1327,40 @@ fn effective_launch_count(on_disk: u32) -> u32 {
     on_disk.saturating_add(1)
 }
 
+/// Log targets granted DEBUG despite the global `Info` floor in [`run`].
+///
+/// Held as data rather than a chain of `.level_for(...)` calls so
+/// `lib_tests::debug_log_targets_cover_background_machinery` can assert the
+/// set. A target silently dropped from this list makes the corresponding
+/// subsystem unobservable in the shipped app while every test still passes —
+/// not hypothetical: it happened twice while dogfooding plan 041 (see
+/// `.claude/learned/035_instrumentation_is_only_as_good_as_its_observability.md`).
+///
+/// Each entry costs DEBUG output in every user's log file, so each needs a
+/// reason:
+/// - `muni` — the crate's own general diagnostics.
+/// - `lid` — feature 025's audio-LID per-window skip events and routing
+///   diagnostics; bounded, since skip lines only fire when the opt-in
+///   `MUNI_VAD_AUDIO_LID_GATE` gate is on.
+/// - `groq_keepalive` — plan 041. A detached loop whose only INFO line fires
+///   once at boot; its per-tick `ping ok` / `skip: real Groq call within 240s`
+///   outcomes are the sole evidence it still works, and it talks to a paid API
+///   every 240 s. ~15 lines/hour.
+/// - `groq_whisper` — plan 041. `audio codec=flac|wav bytes=N` is the only
+///   signal distinguishing a FLAC upload from the WAV fallback. One line per
+///   Whisper-served press.
+/// - `groq_warmup` — plan 041. The `disabled via MUNI_CACHE_REWARM=false` /
+///   `warmup disabled via MUNI_CLEANUP_WARMUP=false` / `skipping warmup: … not
+///   managed` arms are the only way to tell "opt-out honoured" from "silently
+///   broken"; the fire path already logs at INFO.
+const DEBUG_LOG_TARGETS: &[&str] = &[
+    "muni",
+    "lid",
+    "groq_keepalive",
+    "groq_whisper",
+    "groq_warmup",
+];
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Make crashes legible (and recoverable): log the panic site before the
@@ -1417,17 +1455,13 @@ pub fn run() {
     let trace_gladia = std::env::var("MUNI_TRACE_GLADIA")
         .map(|v| v.trim() == "1")
         .unwrap_or(false);
-    let mut log_builder = tauri_plugin_log::Builder::new()
-        .level(log::LevelFilter::Info)
-        .level_for("muni", log::LevelFilter::Debug)
-        // Feature 025 — the audio-LID gate's per-window skip events
-        // (`audio-LID: window skipped (vad_silent, ...)`) and routing
-        // diagnostics fire at DEBUG against the `lid` target. The
-        // global `.level(Info)` floor would otherwise drop them.
-        // Cost is bounded: skip lines only fire when the gate is on
-        // (opt-in via `MUNI_VAD_AUDIO_LID_GATE`), and the routing
-        // diagnostics already fire elsewhere at INFO.
-        .level_for("lid", log::LevelFilter::Debug)
+    // Targets and their rationale live in `DEBUG_LOG_TARGETS`; applied as a
+    // loop so the set stays assertable by a regression test.
+    let mut log_builder = tauri_plugin_log::Builder::new().level(log::LevelFilter::Info);
+    for target in DEBUG_LOG_TARGETS {
+        log_builder = log_builder.level_for(*target, log::LevelFilter::Debug);
+    }
+    log_builder = log_builder
         // Backlog 0050 — the plugin's default `max_file_size` is 40 KB,
         // which rotates `Muni.log` mid-batch during a multi-press dogfood
         // session (observed at ~6 KB and ~23 KB during feat/026 dogfood
@@ -1905,7 +1939,38 @@ pub fn run() {
             // starting.
             let user_prompt = UserPrompt::from_app(app.handle());
             app.manage(Arc::clone(&user_prompt));
-            let groq_client = match GroqClient::new() {
+
+            // Plan 041 (task 6) — build the ONE `reqwest::Client` shared
+            // by all three Groq clients (cleanup / Whisper / LID) and the
+            // pool keepalive so they share a single warm TCP/TLS pool.
+            // On the (near-impossible) builder failure, each client falls
+            // back to its own standalone constructor — behaviour reverts
+            // to pre-plan-041 (three separate pools), never a boot
+            // failure.
+            let shared_groq_http = match groq::shared_groq_http() {
+                Ok(http) => Some(http),
+                Err(err) => {
+                    log::error!(
+                        target: "groq",
+                        "shared Groq HTTP client build failed: {} ({:?}) — falling back to per-client pools",
+                        err.user_message(),
+                        err.severity()
+                    );
+                    None
+                }
+            };
+
+            let groq_client = match shared_groq_http
+                .as_ref()
+                .map(|http| {
+                    Ok(GroqClient::with_http_client(
+                        http.clone(),
+                        groq::resolve_groq_endpoint(),
+                        groq::resolve_cleanup_model(),
+                    ))
+                })
+                .unwrap_or_else(GroqClient::new)
+            {
                 Ok(c) => {
                     // Mirror the `[lid] boot:` line so the cleanup
                     // configuration is visible at startup without
@@ -1967,7 +2032,16 @@ pub fn run() {
             // Spike — Whisper client init mirrors GroqClient: failures
             // log loudly but the app still boots. The orchestrator
             // falls back to Deepgram when whisper is None.
-            let whisper_client = match GroqWhisperClient::new() {
+            let whisper_client = match shared_groq_http
+                .as_ref()
+                .map(|http| {
+                    Ok(GroqWhisperClient::with_http_client(
+                        http.clone(),
+                        GroqWhisperClient::resolve_endpoint(),
+                    ))
+                })
+                .unwrap_or_else(GroqWhisperClient::new)
+            {
                 Ok(c) => Some(Arc::new(c)),
                 Err(err) => {
                     log::error!(
@@ -2037,7 +2111,7 @@ pub fn run() {
             // `None`, which makes the LID task default each press
             // to Whisper (see `whisper: None` graceful-degradation
             // pattern).
-            let text_lid_client = build_text_lid_classifier();
+            let text_lid_client = build_text_lid_classifier(shared_groq_http.as_ref());
             // Backlog 0012 — opt-in secondary classifier for hybrid
             // mode (`MUNI_LID_HYBRID=true`). `None` keeps the LID
             // task on the single-classifier 0011 path.
@@ -2070,7 +2144,7 @@ pub fn run() {
             // its secondary (backlog 0012's design); these are
             // independent factories for independent code paths.
             let text_lid_secondary_client = if audio_lid_client.is_some() {
-                build_audio_hybrid_secondary_classifier()
+                build_audio_hybrid_secondary_classifier(shared_groq_http.as_ref())
             } else {
                 text_lid_secondary_client
             };
@@ -2312,6 +2386,42 @@ pub fn run() {
                 }
             }
 
+            // Plan 041 (task 7) — shared Groq activity tracker. Fed by
+            // the delivery tail (cleanup → prefix touch) and the Whisper
+            // transcribe path (call), read by the keepalive skip-gate
+            // (task 8) and the periodic cache re-warm (slice 4). Managed
+            // so the update sites can pull it from Tauri state the same
+            // way they reach `usage_tx`.
+            let groq_activity = Arc::new(GroqActivity::new());
+            app.manage(Arc::clone(&groq_activity));
+
+            // Plan 041 (task 8) — Groq connection-pool keepalive. Spawned
+            // with a CLONE of the shared client so the connection it
+            // keeps warm is the one real presses reuse. Gated on
+            // `MUNI_GROQ_KEEPALIVE` (opt-out) and on the shared client
+            // having built. `JoinHandle` dropped on the floor —
+            // process-lifetime, mirrors the prices refresher above.
+            if groq_keepalive::is_enabled() {
+                if let Some(ref http) = shared_groq_http {
+                    drop(groq_keepalive::spawn(
+                        http.clone(),
+                        Arc::clone(&groq_activity),
+                        groq_keepalive::DEFAULT_MODELS_ENDPOINT.to_string(),
+                    ));
+                } else {
+                    log::debug!(
+                        target: "groq_keepalive",
+                        "keepalive not spawned: shared Groq HTTP client unavailable"
+                    );
+                }
+            } else {
+                log::debug!(
+                    target: "groq_keepalive",
+                    "keepalive disabled via {}=false",
+                    groq_keepalive::KEEPALIVE_ENV
+                );
+            }
+
             // Phase 10 — surface typed errors to the user via the
             // ErrorPresenter (loud → notification, quiet → emit
             // `error://quiet`). The presenter closes over an `AppHandle`
@@ -2391,6 +2501,7 @@ pub fn run() {
                             Arc::clone(&vocabulary),
                             Arc::clone(&user_prompt),
                             usage_tx.clone(),
+                            Some(Arc::clone(&groq_activity)),
                             groq_warmup::WarmupTrigger::Boot,
                         ));
                     }
@@ -2403,6 +2514,31 @@ pub fn run() {
                 log::info!(
                     target: "groq_warmup",
                     "boot warmup disabled via MUNI_CLEANUP_WARMUP=false"
+                );
+            }
+
+            // Plan 041 (slice 4) — periodic prompt-cache re-warm. A 5-min
+            // staleness tick that fires a re-warm once the cache has been
+            // idle ≥ 90 min, so Groq's 2h cache eviction never taxes the
+            // first press after a gap. Gated on `MUNI_CACHE_REWARM`
+            // (opt-out, spawn-site check) AND, per-fire,
+            // `warmup_from_app`'s own `MUNI_CLEANUP_WARMUP` gate — both
+            // flags apply. Reads the SAME `groq_activity` the boot
+            // warm-up above and every real press cleanup touch, so a
+            // fresh boot (which just stamped `last_prefix_touch`) makes
+            // the tick's first staleness check a no-op rather than a
+            // double-fire. `JoinHandle` dropped on the floor —
+            // process-lifetime, mirrors the keepalive spawn above.
+            if groq_warmup::is_rewarm_enabled() {
+                drop(groq_warmup::spawn_periodic_rewarm(
+                    app.handle().clone(),
+                    Arc::clone(&groq_activity),
+                ));
+            } else {
+                log::debug!(
+                    target: "groq_warmup",
+                    "periodic re-warm disabled via {}=false",
+                    groq_warmup::CACHE_REWARM_ENV
                 );
             }
 
@@ -2439,6 +2575,8 @@ pub fn run() {
                 english_fast_mode,
                 bilingual_mode,
                 usage_tx,
+                usage_store: usage_store.clone(),
+                groq_activity: Some(Arc::clone(&groq_activity)),
                 my_words: Arc::clone(&my_words),
                 about_me: Arc::clone(&about_me),
                 vocabulary: Arc::clone(&vocabulary),
@@ -2654,6 +2792,20 @@ fn spawn_retention_purge_task(
                             log::info!(target: "usage", "api_calls purge: removed {n} stale rows")
                         }
                         Err(err) => log::warn!(target: "usage", "api_calls purge failed: {err}"),
+                    }
+                    // Plan 041 (wave 1) — the press-timing ledger shares the
+                    // `api_calls` retention window (no user-facing control).
+                    match store.purge_press_timings_older_than(API_CALLS_RETENTION_DAYS) {
+                        Ok(0) => {
+                            log::debug!(target: "usage", "press_timings purge: 0 stale rows")
+                        }
+                        Ok(n) => log::info!(
+                            target: "usage",
+                            "press_timings purge: removed {n} stale rows"
+                        ),
+                        Err(err) => {
+                            log::warn!(target: "usage", "press_timings purge failed: {err}")
+                        }
                     }
                 }
             })
@@ -3057,13 +3209,39 @@ fn resolve_vad_stream_word_guard_ms() -> u32 {
 ///
 /// Pulled out as a free function so the env-resolution logic is
 /// testable and the `setup` callback stays thin.
-fn build_text_lid_classifier() -> Option<Arc<dyn TextLidClassifier>> {
+/// Plan 041 (task 6) — construct a [`GroqLidClient`] on the shared Groq
+/// connection pool when a shared client is available, or via the
+/// standalone `with_model` constructor otherwise (tests / boot-fallback
+/// when the shared client failed to build). Both target
+/// [`groq_lid::DEFAULT_ENDPOINT`]; the only difference is which pool the
+/// client dials through.
+fn build_groq_lid_client(
+    shared_http: Option<&reqwest::Client>,
+    model: String,
+) -> Result<GroqLidClient, MuniError> {
+    match shared_http {
+        Some(http) => Ok(GroqLidClient::with_http_client(
+            http.clone(),
+            groq_lid::DEFAULT_ENDPOINT.to_string(),
+            model,
+        )),
+        None => GroqLidClient::with_model(model),
+    }
+}
+
+fn build_text_lid_classifier(
+    shared_http: Option<&reqwest::Client>,
+) -> Option<Arc<dyn TextLidClassifier>> {
     let provider = resolve_lid_provider_slug();
     let model_override = std::env::var(LID_MODEL_ENV)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    build_text_lid_classifier_for_provider(provider.as_str(), model_override.as_deref())
+    build_text_lid_classifier_for_provider(
+        shared_http,
+        provider.as_str(),
+        model_override.as_deref(),
+    )
 }
 
 /// Feature 020 — provider slug that selects the local whisper.cpp
@@ -3098,6 +3276,7 @@ fn resolve_lid_provider_slug() -> String {
 /// tests can exercise the groq/gemini construction paths without
 /// touching process-wide env vars.
 fn build_text_lid_classifier_for_provider(
+    shared_http: Option<&reqwest::Client>,
     provider: &str,
     model_override: Option<&str>,
 ) -> Option<Arc<dyn TextLidClassifier>> {
@@ -3107,7 +3286,11 @@ fn build_text_lid_classifier_for_provider(
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| groq_lid::DEFAULT_MODEL.to_string());
             log::info!(target: "lid", "boot: text-LID provider=groq model={model}");
-            GroqLidClient::with_model(model).map(|c| Arc::new(c) as Arc<dyn TextLidClassifier>)
+            // Plan 041 (task 6) — inject the shared Groq pool when
+            // available; the standalone `with_model` fallback keeps the
+            // rollback smoke tests key-free and pool-agnostic.
+            let client = build_groq_lid_client(shared_http, model);
+            client.map(|c| Arc::new(c) as Arc<dyn TextLidClassifier>)
         }
         "gemini" => {
             let model = model_override
@@ -3247,7 +3430,9 @@ fn build_secondary_lid_classifier() -> Option<Arc<dyn TextLidClassifier>> {
 /// Gated by [`MUNI_LID_AUDIO_HYBRID_ENV`]. Construction failures
 /// degrade gracefully — audio-LID alone handles the press if the
 /// secondary is unavailable.
-fn build_audio_hybrid_secondary_classifier() -> Option<Arc<dyn TextLidClassifier>> {
+fn build_audio_hybrid_secondary_classifier(
+    shared_http: Option<&reqwest::Client>,
+) -> Option<Arc<dyn TextLidClassifier>> {
     if !resolve_audio_hybrid_enabled() {
         return None;
     }
@@ -3256,7 +3441,7 @@ fn build_audio_hybrid_secondary_classifier() -> Option<Arc<dyn TextLidClassifier
         target: "lid",
         "boot: audio-LID hybrid secondary=groq model={model} (enabled via {MUNI_LID_AUDIO_HYBRID_ENV})"
     );
-    match GroqLidClient::with_model(model) {
+    match build_groq_lid_client(shared_http, model) {
         Ok(c) => Some(Arc::new(c) as Arc<dyn TextLidClassifier>),
         Err(err) => {
             log::error!(
@@ -3485,6 +3670,42 @@ fn read_launch_at_login_pref(app: &AppHandle) -> bool {
 mod lib_tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Plan 041 dogfooding found the same defect twice: a subsystem whose only
+    /// runtime evidence is `log::debug!` is invisible in the shipped app unless
+    /// its target sits in [`DEBUG_LOG_TARGETS`], because `run()` sets a global
+    /// `Info` floor. Both times the full suite stayed green — the keepalive
+    /// looked identical whether it was pinging a paid API every 240 s or
+    /// wedged, and two dogfood presses exercised the FLAC upload path while
+    /// producing no observable output at all.
+    ///
+    /// This test is the guard: dropping a target from the list to "reduce log
+    /// noise" silently re-breaks that observability, and nothing else would
+    /// catch it. If you are here because this test failed, the question to
+    /// answer is "how would we detect this subsystem misbehaving in a user's
+    /// log?" — not "how do I make the test pass".
+    #[test]
+    fn debug_log_targets_cover_background_machinery() {
+        for required in ["groq_keepalive", "groq_whisper", "groq_warmup"] {
+            assert!(
+                DEBUG_LOG_TARGETS.contains(&required),
+                "`{required}` must stay in DEBUG_LOG_TARGETS — its only evidence \
+                 of correct behaviour is DEBUG, so removing it makes the \
+                 subsystem unobservable at the global Info floor"
+            );
+        }
+        // The list is an allowlist against a global floor, so a duplicate is a
+        // sign of a careless merge rather than intent to double-register.
+        let mut seen = DEBUG_LOG_TARGETS.to_vec();
+        seen.sort_unstable();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(
+            before,
+            seen.len(),
+            "DEBUG_LOG_TARGETS has a duplicate entry"
+        );
+    }
 
     #[test]
     fn arm_failure_surfaces_only_when_onboarded() {
@@ -3917,7 +4138,7 @@ mod lib_tests {
 
     #[test]
     fn text_lid_groq_provider_builds_classifier_for_rollback() {
-        let client = build_text_lid_classifier_for_provider("groq", None).expect(
+        let client = build_text_lid_classifier_for_provider(None, "groq", None).expect(
             "groq factory must construct without an API key (key is resolved at classify time)",
         );
         let label = client.provider_label();
@@ -3929,7 +4150,7 @@ mod lib_tests {
 
     #[test]
     fn text_lid_gemini_provider_builds_classifier_for_rollback() {
-        let client = build_text_lid_classifier_for_provider("gemini", None).expect(
+        let client = build_text_lid_classifier_for_provider(None, "gemini", None).expect(
             "gemini factory must construct without an API key (key is resolved at classify time)",
         );
         let label = client.provider_label();
@@ -3946,14 +4167,15 @@ mod lib_tests {
         // and confuse the rollback rule). Feature 020 default flip
         // also makes the empty provider yield to audio.
         assert!(build_text_lid_classifier_for_provider(
+            None,
             AUDIO_LID_PROVIDER_AUDIO_WHISPER_TINY,
             None
         )
         .is_none());
-        assert!(build_text_lid_classifier_for_provider("", None).is_none());
+        assert!(build_text_lid_classifier_for_provider(None, "", None).is_none());
         // An unknown slug also yields to audio (not silently falling
         // through to groq), since audio is now the safe default.
-        assert!(build_text_lid_classifier_for_provider("soniox", None).is_none());
+        assert!(build_text_lid_classifier_for_provider(None, "soniox", None).is_none());
     }
 
     // ---- feature 023 (backlog 0040): VAD gate boot wiring -----------------

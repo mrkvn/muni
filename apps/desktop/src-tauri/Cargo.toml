@@ -144,6 +144,15 @@ sentry-rust-minidump = "0.16"
 # sent to telemetry. `rand` for `before_send` non-fatal sampling.
 uuid = { version = "1", features = ["v4"] }
 rand = "0.10"
+# Plan 041 (task 9) — pure-Rust FLAC encoder for Groq Whisper uploads.
+# Lossless container swap only (WAV -> FLAC): decoded PCM samples are
+# bit-identical, so this cannot change transcript output, only halve
+# upload bytes. `default-features = false` + explicit `log` because
+# flacenc's actual default feature set includes `par` (multi-threaded
+# encoding via crossbeam-channel) — our 16kHz mono presses encode in
+# single-digit milliseconds single-threaded, so `par`/`simd-nightly`
+# stay off per plan.
+flacenc = { version = "0.5", default-features = false, features = ["log"] }
 
 # Debug-only Tauri MCP bridge — exposes the running webview to the
 # Tauri MCP server so an automation agent can inspect/manipulate the
@@ -185,6 +194,10 @@ objc2-service-management = { version = "0.3", default-features = false, features
 tokio = { version = "1", features = ["test-util", "macros", "rt", "rt-multi-thread", "sync", "time", "process", "io-util"] }
 tempfile = "3"
 wiremock = "0.6"
+# Plan 041 (task 9) — FLAC decoder, round-trip-test only. Confirms
+# `encode_flac` output decodes back to bit-identical samples; never
+# linked into the shipped binary.
+claxon = "0.4"
 
 [profile.dev]
 incremental = true

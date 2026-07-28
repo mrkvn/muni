@@ -1,4 +1,8 @@
 use super::*;
+// No longer re-exported via `super::*`: production code tags Deepgram presses
+// `SERVED_BY_DEEPGRAM`, so `mod.rs` stopped importing the Gladia label. These
+// fixtures still seed rows with it to cover the legacy/Gladia-served shape.
+use crate::history_store::SERVED_BY_GLADIA_PRIMARY;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -114,6 +118,8 @@ fn session_with(
         english_fast_mode: EnglishFastModeFlag::default(),
         bilingual_mode: BilingualModeFlag::default(),
         usage_tx: None,
+        usage_store: None,
+        groq_activity: None,
         my_words: std::sync::Arc::new(crate::my_words::MyWords::default()),
         about_me: crate::about_me::AboutMe::empty(),
         vocabulary: crate::vocabulary::Vocabulary::empty(),
@@ -286,6 +292,8 @@ async fn deliveries_paste_in_press_order_when_later_would_overtake() {
         english_fast_mode: EnglishFastModeFlag::default(),
         bilingual_mode: BilingualModeFlag::default(),
         usage_tx: None,
+        usage_store: None,
+        groq_activity: None,
         my_words: std::sync::Arc::new(crate::my_words::MyWords::default()),
         about_me: crate::about_me::AboutMe::empty(),
         vocabulary: crate::vocabulary::Vocabulary::empty(),
@@ -302,10 +310,14 @@ async fn deliveries_paste_in_press_order_when_later_would_overtake() {
     let ctx_a = DeliveryContext {
         order: None,
         epoch: None,
+        press_t0: Instant::now(),
+        timing: PressTiming::default(),
     };
     let ctx_b = DeliveryContext {
         order: Some(a_done_rx),
         epoch: None,
+        press_t0: Instant::now(),
+        timing: PressTiming::default(),
     };
 
     let sa = session.clone();
@@ -370,6 +382,8 @@ async fn stale_delivery_hud_transition_is_suppressed_by_newer_press() {
             DeliveryContext {
                 order: None,
                 epoch: Some(1),
+                press_t0: Instant::now(),
+                timing: PressTiming::default(),
             },
         )
         .await;
@@ -403,6 +417,8 @@ async fn current_delivery_transitions_hud_to_idle() {
             DeliveryContext {
                 order: None,
                 epoch: Some(1),
+                press_t0: Instant::now(),
+                timing: PressTiming::default(),
             },
         )
         .await;
@@ -436,6 +452,8 @@ async fn cancel_does_not_abort_in_flight_delivery() {
             DeliveryContext {
                 order: None,
                 epoch: Some(1),
+                press_t0: Instant::now(),
+                timing: PressTiming::default(),
             },
         )
         .await;
@@ -723,6 +741,8 @@ async fn deliver_final_paste_failure_other_than_nothing_emits_error() {
         english_fast_mode: EnglishFastModeFlag::default(),
         bilingual_mode: BilingualModeFlag::default(),
         usage_tx: None,
+        usage_store: None,
+        groq_activity: None,
         my_words: std::sync::Arc::new(crate::my_words::MyWords::default()),
         about_me: crate::about_me::AboutMe::empty(),
         vocabulary: crate::vocabulary::Vocabulary::empty(),
@@ -791,6 +811,8 @@ async fn deliver_final_nothing_to_paste_is_quiet() {
         english_fast_mode: EnglishFastModeFlag::default(),
         bilingual_mode: BilingualModeFlag::default(),
         usage_tx: None,
+        usage_store: None,
+        groq_activity: None,
         my_words: std::sync::Arc::new(crate::my_words::MyWords::default()),
         about_me: crate::about_me::AboutMe::empty(),
         vocabulary: crate::vocabulary::Vocabulary::empty(),
@@ -889,6 +911,8 @@ async fn deliver_final_no_editable_focus_holds_for_repaste() {
         english_fast_mode: EnglishFastModeFlag::default(),
         bilingual_mode: BilingualModeFlag::default(),
         usage_tx: None,
+        usage_store: None,
+        groq_activity: None,
         my_words: std::sync::Arc::new(crate::my_words::MyWords::default()),
         about_me: crate::about_me::AboutMe::empty(),
         vocabulary: crate::vocabulary::Vocabulary::empty(),
@@ -1330,6 +1354,8 @@ async fn pressed_with_failing_pool_emits_listening_before_error() {
         english_fast_mode: EnglishFastModeFlag::default(),
         bilingual_mode: BilingualModeFlag::default(),
         usage_tx: None,
+        usage_store: None,
+        groq_activity: None,
         my_words: std::sync::Arc::new(crate::my_words::MyWords::default()),
         about_me: crate::about_me::AboutMe::empty(),
         vocabulary: crate::vocabulary::Vocabulary::empty(),
@@ -3709,6 +3735,8 @@ fn minimal_deps_for_trim_test(
         english_fast_mode: EnglishFastModeFlag::default(),
         bilingual_mode: BilingualModeFlag::default(),
         usage_tx: None,
+        usage_store: None,
+        groq_activity: None,
         my_words: Arc::new(crate::my_words::MyWords::default()),
         about_me: crate::about_me::AboutMe::empty(),
         vocabulary: crate::vocabulary::Vocabulary::empty(),
@@ -4666,6 +4694,8 @@ async fn deepgram_err_arm_rescues_via_whisper_and_persists_provenance() {
         english_fast_mode: EnglishFastModeFlag::default(),
         bilingual_mode: BilingualModeFlag::default(),
         usage_tx: None,
+        usage_store: None,
+        groq_activity: None,
         my_words: std::sync::Arc::new(crate::my_words::MyWords::default()),
         about_me: crate::about_me::AboutMe::empty(),
         vocabulary: crate::vocabulary::Vocabulary::empty(),
@@ -4681,7 +4711,7 @@ async fn deepgram_err_arm_rescues_via_whisper_and_persists_provenance() {
     let active = deepgram_active_dead_socket(samples, 8000);
 
     let out = session
-        .finalize_auto_detect(active, Duration::from_secs(3))
+        .finalize_auto_detect(active, Duration::from_secs(3), &mut None)
         .await;
 
     std::env::remove_var(crate::secrets::GROQ_ENV_VAR);
@@ -4805,6 +4835,8 @@ async fn pool_outage_at_press_start_installs_whisper_batch_session() {
         english_fast_mode: EnglishFastModeFlag::default(),
         bilingual_mode: BilingualModeFlag::default(),
         usage_tx: None,
+        usage_store: None,
+        groq_activity: None,
         my_words: std::sync::Arc::new(crate::my_words::MyWords::default()),
         about_me: crate::about_me::AboutMe::empty(),
         vocabulary: crate::vocabulary::Vocabulary::empty(),
@@ -4898,6 +4930,8 @@ async fn whisper_batch_finalize_rescues_via_whisper_with_recovering_pill() {
         english_fast_mode: EnglishFastModeFlag::default(),
         bilingual_mode: BilingualModeFlag::default(),
         usage_tx: None,
+        usage_store: None,
+        groq_activity: None,
         my_words: std::sync::Arc::new(crate::my_words::MyWords::default()),
         about_me: crate::about_me::AboutMe::empty(),
         vocabulary: crate::vocabulary::Vocabulary::empty(),
@@ -5024,6 +5058,8 @@ async fn audible_press_clears_stale_mic_silenced_latch() {
         english_fast_mode: EnglishFastModeFlag::default(),
         bilingual_mode: BilingualModeFlag::default(),
         usage_tx: None,
+        usage_store: None,
+        groq_activity: None,
         my_words: std::sync::Arc::new(crate::my_words::MyWords::default()),
         about_me: crate::about_me::AboutMe::empty(),
         vocabulary: crate::vocabulary::Vocabulary::empty(),
@@ -5111,6 +5147,8 @@ async fn vad_no_speech_on_audible_press_does_not_mark_mic_stale() {
         english_fast_mode: EnglishFastModeFlag::default(),
         bilingual_mode: BilingualModeFlag::default(),
         usage_tx: None,
+        usage_store: None,
+        groq_activity: None,
         my_words: std::sync::Arc::new(crate::my_words::MyWords::default()),
         about_me: crate::about_me::AboutMe::empty(),
         vocabulary: crate::vocabulary::Vocabulary::empty(),

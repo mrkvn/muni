@@ -100,14 +100,24 @@ impl GroqLidClient {
                 .map_err(|e| MuniError::GroqConnectionFailed {
                     reason: e.to_string(),
                 })?;
+        Ok(Self::with_http_client(http, endpoint, model))
+    }
+
+    /// Construct around an already-built `reqwest::Client`. Plan 041
+    /// (task 6) — lets the LID classifier builders in `lib.rs` inject a
+    /// clone of the one [`crate::groq::shared_groq_http`] pool so the
+    /// LID client shares connections with the cleanup and Whisper
+    /// clients. The per-request timeout is applied at the classify call
+    /// site, never on the injected client, so sharing the pool is safe.
+    pub fn with_http_client(http: reqwest::Client, endpoint: String, model: String) -> Self {
         let label = format!("groq:{model}");
-        Ok(Self {
+        Self {
             endpoint,
             model,
             label,
             http,
             timeout: LID_TIMEOUT,
-        })
+        }
     }
 
     /// Classify `text` using an explicit `api_key`.

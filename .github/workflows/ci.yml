@@ -15,16 +15,18 @@ permissions:
   contents: read
 
 jobs:
-  # Frontend checks only, deliberately on ubuntu.
+  # Frontend checks, deliberately on ubuntu — free on public repositories and
+  # sufficient for the TypeScript side, which has no macOS dependency.
   #
-  # The Rust/Tauri side needs macOS (the crate links AppKit/CoreGraphics), and
-  # macOS runner minutes are metered — they exhausted this account's included
-  # quota once already. Standard ubuntu runners are free on public repositories,
-  # so this job costs nothing while still giving an outside contributor
-  # automated feedback on a pull request.
+  # The Rust/Tauri side needs macOS (the crate links AppKit/CoreGraphics) and
+  # lives in `ci-rust.yml`, in its own workflow so it can carry a `paths:`
+  # filter and only run when Rust actually changes — `paths:` applies
+  # per-workflow, not per-job. That filter is the cost control that made it
+  # safe to add back after macOS minutes exhausted this account's quota once
+  # while the repo was private (see `.claude/learned/034_*`).
   #
-  # `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` are NOT run
-  # here. Run them locally before pushing:  make lint && make test
+  # Running the Rust checks locally before pushing is still the fast path:
+  #   make lint && make test
   frontend:
     runs-on: ubuntu-latest
     steps:

@@ -1,0 +1,108 @@
+name: CI (Rust)
+
+# Separate from `ci.yml` so this workflow can carry its own `paths:` filter —
+# `paths:` applies per-workflow, not per-job, and the frontend job must keep
+# running on every pull request.
+#
+# ## Why this exists
+#
+# `ci.yml` deliberately ran frontend checks only, on the reasoning that the
+# Rust side needs macOS and macOS runner minutes had already exhausted this
+# account's quota once (see `.claude/learned/034_*`). That reasoning was sound
+# while `muni` was private. The consequence, though, was that the entire Rust
+# codebase — where nearly all of the app's logic lives — had no automated
+# verification at all: a pull request could turn `cargo test` red and still
+# show an all-green check list. Plan 041 merged 2,400 lines of Rust with the
+# suite verified only on one contributor's laptop.
+#
+# ## Cost control
+#
+# The job is bounded three ways rather than by omission:
+#
+#  1. `paths:` — it runs only when Rust sources, the Cargo manifests, or this
+#     workflow change. A docs- or frontend-only pull request never starts it.
+#  2. `concurrency` — a fast-follow push cancels the superseded run.
+#  3. `Swatinem/rust-cache` — the dependency build (whisper-rs, tauri, and the
+#     rest) is restored rather than recompiled; only changed crates rebuild.
+#
+# NOTE FOR WHOEVER MERGES THIS: GitHub's own documentation is ambiguous about
+# whether macOS runners are free on *public* repositories — one page says
+# Actions is free for public repos on standard runners, another implies macOS
+# is excluded. This repository is public, but that question was NOT resolved
+# before adding this workflow. Check the Actions usage page after the first few
+# runs (Settings → Billing → Actions). If macOS is in fact metered here, the
+# `paths:` filter already keeps the volume low, but consider dropping the job
+# to `push: [main]` only, or splitting `cargo fmt` onto ubuntu.
+
+on:
+  pull_request:
+    paths:
+      - 'apps/desktop/src-tauri/**'
+      - '.github/workflows/ci-rust.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'apps/desktop/src-tauri/**'
+      - '.github/workflows/ci-rust.yml'
+
+concurrency:
+  group: ci-rust-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    # macOS is required, not preferred: the crate links AppKit/CoreGraphics
+    # (see `injection/macos.rs`), so it cannot build on ubuntu.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7
+
+      # `build.rs` calls `tauri_build::build()`, which validates the
+      # `frontendDist: "../dist"` path from `tauri.conf.json`. `dist/` is not
+      # tracked in git, so on a fresh checkout every cargo invocation — including
+      # `cargo test` — fails until the frontend has been built once. A local
+      # `cargo test` succeeds only because `dist/` is already present from a
+      # previous `pnpm dev`, which is exactly why this gap survived so long.
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install JS deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend (required by tauri_build)
+        run: pnpm --filter desktop build
+
+      # `rust-version = "1.80"` in Cargo.toml is the floor, not a pin; stable
+      # is what contributors actually build with.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+
+      # Mirrors `make lint-rust` / `make test-rust` so a contributor can
+      # reproduce a CI failure with one local command.
+      - name: Format
+        run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      # `--all-targets` above compiles under `cfg(test)`, which hides an unused
+      # import that only test code consumes. A plain build catches it; clippy
+      # does not (see `.claude/learned/035_*`).
+      - name: Build (non-test, catches cfg(test)-masked warnings)
+        run: cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+      - name: Tests
+        run: cargo test --features test-fixtures --manifest-path apps/desktop/src-tauri/Cargo.toml

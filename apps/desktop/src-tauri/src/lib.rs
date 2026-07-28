@@ -1442,6 +1442,20 @@ pub fn run() {
         // only evidence that real dictation traffic correctly suppresses a
         // redundant ping.
         .level_for("groq_keepalive", log::LevelFilter::Debug)
+        // Plan 041 — same rationale as the keepalive above, for the two other
+        // targets whose only evidence of a plan-041 behaviour is DEBUG:
+        //   * `groq_whisper` emits `audio codec=flac|wav bytes=N` — the sole
+        //     signal distinguishing a FLAC upload from the WAV fallback. One
+        //     line per Whisper-served press.
+        //   * `groq_warmup` emits the `disabled via MUNI_CACHE_REWARM=false` /
+        //     `warmup disabled via MUNI_CLEANUP_WARMUP=false` / `skipping
+        //     warmup: … not managed` arms — the only way to tell "opt-out
+        //     honoured" from "silently broken". The fire path already logs
+        //     `warmup ok … trigger=…` at INFO; these cover the non-fire cases.
+        // Both are low-volume: a handful at boot plus at most one per press or
+        // per 5-minute tick.
+        .level_for("groq_whisper", log::LevelFilter::Debug)
+        .level_for("groq_warmup", log::LevelFilter::Debug)
         // Backlog 0050 — the plugin's default `max_file_size` is 40 KB,
         // which rotates `Muni.log` mid-batch during a multi-press dogfood
         // session (observed at ~6 KB and ~23 KB during feat/026 dogfood

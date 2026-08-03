@@ -1,6 +1,6 @@
 [package]
 name = "muni"
-version = "0.7.0"
+version = "0.8.0"
 description = "Muni — push-to-talk dictation"
 authors = ["mrkvn"]
 edition = "2021"
